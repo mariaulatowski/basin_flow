@@ -1,3 +1,5 @@
 texas_nhdplusgrb/
 *.zip
 *_extracted_gdb/
+__pycache__/
+*.py[cod]

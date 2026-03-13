@@ -2,7 +2,7 @@
 
 ## 1. Create the Conda environment
 
-From `C:\Users\mu3575\Documents\WAM`:
+In path where the model is stored:
 
 ```powershell
 conda env create -f environment.yml
