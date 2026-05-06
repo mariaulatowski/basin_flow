@@ -24,10 +24,7 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
-from matplotlib.backends.backend_pdf import PdfPages
-import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
-from shapely.geometry import box
 
 
 MONTH_COLS = [
@@ -59,12 +56,6 @@ class ModelConfig:
     output_file: str
     output_shapefile: str | None = None
     shapefile_date: str | None = None
-    segment_report_pdf: str | None = "avg_monthly_segment_volume.pdf"
-    grid_report_pdf: str | None = "avg_monthly_gridcell_volume.pdf"
-    segment_report_csv: str | None = "avg_monthly_segment_volume.csv"
-    grid_report_csv: str | None = "avg_monthly_gridcell_volume.csv"
-    grid_centroids_file: str | None = "inputData/Centroids_HillCountry.csv"
-    grid_cell_miles: float = 1.0
     start_date: str = "2010-01-01"
     end_date: str = "2024-12-01"
     runoff_coeff_m_per_month: float = 0.0008
@@ -150,14 +141,9 @@ def _read_internal_vaa_from_gdbs(flowline_source: str) -> pd.DataFrame:
 
     frames = []
     for gdb in gdb_paths:
-        vaa = None
-        for layer_name in ("NHDPlusFlowlineVAA", "NHDFlowlineVAA"):
-            try:
-                vaa = gpd.read_file(str(gdb), layer=layer_name, ignore_geometry=True)
-                break
-            except Exception:
-                continue
-        if vaa is None:
+        try:
+            vaa = gpd.read_file(str(gdb), layer="NHDPlusFlowlineVAA", ignore_geometry=True)
+        except Exception:
             continue
         vaa = vaa.rename(columns={c: c.lower() for c in vaa.columns})
         frames.append(vaa)
@@ -269,10 +255,6 @@ def build_network(
             print("Loading internal VAA table from GDB source...")
             vaa = _read_internal_vaa_from_gdbs(flowline_source)
 
-        # Normalize medium-res permanent_identifier -> permanent_ to match HR naming
-        if "permanent_identifier" in vaa.columns and "permanent_" not in vaa.columns:
-            vaa["permanent_"] = vaa["permanent_identifier"].astype(str)
-
         if {"nhdplusid", "fromnode", "tonode"}.issubset(vaa.columns) and "nhdplusid" in flow.columns:
             vaa["nhdplusid"] = pd.to_numeric(vaa["nhdplusid"], errors="coerce")
             merged = flow.merge(
@@ -294,21 +276,14 @@ def build_network(
     if merged.empty:
         raise ValueError("No routed flowlines after VAA merge.")
 
-    if "comid" in merged.columns and pd.to_numeric(merged["comid"], errors="coerce").notna().any():
-        merged["COMID"] = pd.to_numeric(merged["comid"], errors="coerce").round().astype("Int64")
-        merged = merged.dropna(subset=["COMID"]).copy()
-        merged["COMID"] = merged["COMID"].astype(np.int64)
-    elif "nhdplusid" in merged.columns and merged["nhdplusid"].notna().any():
+    if "nhdplusid" in merged.columns and merged["nhdplusid"].notna().any():
         merged["COMID"] = pd.to_numeric(merged["nhdplusid"], errors="coerce").round().astype("Int64")
         merged = merged.dropna(subset=["COMID"]).copy()
         merged["COMID"] = merged["COMID"].astype(np.int64)
     else:
         merged["COMID"] = np.arange(1, len(merged) + 1, dtype=np.int64)
 
-    if "permanent_" in merged.columns:
-        p_to_comid = dict(zip(merged["permanent_"], merged["COMID"]))
-    else:
-        p_to_comid = dict(zip(merged["COMID"].astype(str), merged["COMID"]))
+    p_to_comid = dict(zip(merged["permanent_"], merged["COMID"]))
 
     nodes = merged[["COMID", "fromnode", "tonode", "hydroseq"]].copy()
 
@@ -419,107 +394,6 @@ def snap_control_points_to_comid(flow: gpd.GeoDataFrame, cp_meta: pd.DataFrame) 
     return work
 
 
-def _flow_to_volume_acft(flow_cms: pd.Series, dates: pd.Series) -> pd.Series:
-    # Convert monthly flow (cms) to monthly volume (ac-ft) using each month's length.
-    seconds = pd.to_datetime(dates).dt.days_in_month.astype(float) * 24.0 * 3600.0
-    # 1 ac-ft = 1233.48184 m^3
-    return (flow_cms.astype(float) * seconds) / 1233.48184
-
-
-def _write_table_pdf(df: pd.DataFrame, pdf_path: str, title: str) -> None:
-    if df.empty:
-        raise ValueError(f"No rows available for PDF report: {pdf_path}")
-
-    path = Path(pdf_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    rows_per_page = 35
-    with PdfPages(path) as pdf:
-        for start in range(0, len(df), rows_per_page):
-            chunk = df.iloc[start : start + rows_per_page].copy()
-            fig, ax = plt.subplots(figsize=(11, 8.5))
-            ax.axis("off")
-            ax.set_title(title, fontsize=14, pad=12)
-
-            table = ax.table(
-                cellText=chunk.values,
-                colLabels=chunk.columns.tolist(),
-                cellLoc="center",
-                loc="center",
-            )
-            table.auto_set_font_size(False)
-            table.set_fontsize(8)
-            table.scale(1.0, 1.2)
-
-            pdf.savefig(fig, bbox_inches="tight")
-            plt.close(fig)
-
-
-def _compute_segment_averages(out: pd.DataFrame) -> pd.DataFrame:
-    work = out.copy()
-    work["volume_acft"] = _flow_to_volume_acft(work["flow_cms"], work["date"])
-    avg = (
-        work.groupby("COMID", as_index=False)
-        .agg(
-            avg_flow_cms=("flow_cms", "mean"),
-            avg_monthly_volume_acft=("volume_acft", "mean"),
-            lat=("lat", "first"),
-            lon=("lon", "first"),
-        )
-        .sort_values("COMID")
-    )
-    return avg
-
-
-def _gridcell_totals(
-    flow: gpd.GeoDataFrame,
-    seg_avg: pd.DataFrame,
-    centroids_csv: str,
-    cell_size_miles: float,
-) -> pd.DataFrame:
-    centroids = pd.read_csv(centroids_csv)
-    req = {"FID", "Latitude", "Longitude"}
-    missing = req - set(centroids.columns)
-    if missing:
-        raise KeyError(f"Centroids file missing columns: {sorted(missing)}")
-
-    seg = flow[["COMID", "geometry"]].merge(seg_avg, on="COMID", how="inner")
-    if seg.empty:
-        raise ValueError("No segment averages available for gridcell aggregation.")
-
-    utm_crs = seg.estimate_utm_crs()
-    seg_proj = seg.to_crs(utm_crs)
-    seg_proj["seg_len_m"] = seg_proj.geometry.length
-    seg_proj = seg_proj[seg_proj["seg_len_m"] > 0].copy()
-
-    cent_gdf = gpd.GeoDataFrame(
-        centroids.copy(),
-        geometry=gpd.points_from_xy(centroids["Longitude"], centroids["Latitude"]),
-        crs="EPSG:4326",
-    ).to_crs(utm_crs)
-
-    half = (cell_size_miles * 1609.344) / 2.0
-    cent_gdf["geometry"] = cent_gdf.geometry.apply(
-        lambda p: box(p.x - half, p.y - half, p.x + half, p.y + half)
-    )
-
-    inter = gpd.overlay(seg_proj, cent_gdf, how="intersection")
-    if inter.empty:
-        raise ValueError("No stream segments intersect grid cells.")
-
-    inter["inter_len_m"] = inter.geometry.length
-    inter["length_weight"] = inter["inter_len_m"] / inter["seg_len_m"]
-    inter["vol_acft_in_cell"] = inter["avg_monthly_volume_acft"] * inter["length_weight"]
-
-    totals = (
-        inter.groupby("FID", as_index=False)
-        .agg(total_avg_monthly_volume_acft=("vol_acft_in_cell", "sum"))
-        .merge(centroids[["FID", "Latitude", "Longitude"]], on="FID", how="left")
-        .sort_values("FID")
-    )
-    return totals
-
-
 def parse_flo_monthly(flo_file: str) -> pd.DataFrame:
     rows: list[dict] = []
     with open(flo_file, "r", encoding="utf-8") as f:
@@ -556,56 +430,20 @@ def load_gage_crosswalk(crosswalk_file: str) -> pd.DataFrame:
     return xw[["gage_id", "COMID"]].drop_duplicates()
 
 
-def build_gage_crosswalk_from_cp(flo_file: str, cp_map: pd.DataFrame) -> pd.DataFrame:
-    flo = parse_flo_monthly(flo_file)
-    if flo.empty:
-        return pd.DataFrame(columns=["gage_id", "COMID"])
-
-    cp_lookup = cp_map[["UP_CP", "UP_COMID"]].dropna().drop_duplicates().copy()
-    cp_lookup["UP_CP"] = cp_lookup["UP_CP"].astype(str)
-    cp_lookup["UP_COMID"] = cp_lookup["UP_COMID"].astype(np.int64)
-    cp_to_comid = dict(zip(cp_lookup["UP_CP"], cp_lookup["UP_COMID"]))
-
-    def _match_cp(gage_id: str) -> int | None:
-        raw = str(gage_id)
-        base = raw[2:] if len(raw) > 2 else raw
-        candidates = [base]
-        if base.lstrip("0") != base:
-            candidates.append(base.lstrip("0"))
-        for cand in candidates:
-            if cand in cp_to_comid:
-                return int(cp_to_comid[cand])
-        return None
-
-    rows = []
-    for gid in pd.Series(flo["gage_id"].astype(str).unique()):
-        comid = _match_cp(gid)
-        if comid is not None:
-            rows.append({"gage_id": gid, "COMID": comid})
-
-    if not rows:
-        return pd.DataFrame(columns=["gage_id", "COMID"])
-    return pd.DataFrame(rows).drop_duplicates()
-
-
 def compile_gage_observations(
     flo_file: str,
     start_date: str,
     end_date: str,
     gage_crosswalk_file: str | None,
-    gage_crosswalk_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     flo = parse_flo_monthly(flo_file)
     flo = flo[(flo["date"] >= start_date) & (flo["date"] <= end_date)].copy()
     flo["flow_cms"] = acft_month_to_cms(flo["acft"].to_numpy(), flo["date"])
 
-    if gage_crosswalk_df is None and gage_crosswalk_file is None:
+    if gage_crosswalk_file is None:
         return pd.DataFrame(columns=["date", "COMID", "flow_cms"])
 
-    if gage_crosswalk_df is not None:
-        xw = gage_crosswalk_df.copy()
-    else:
-        xw = load_gage_crosswalk(gage_crosswalk_file)
+    xw = load_gage_crosswalk(gage_crosswalk_file)
     obs = flo.merge(xw, on="gage_id", how="inner")
     return obs[["date", "COMID", "flow_cms"]]
 
@@ -621,24 +459,13 @@ def _build_edge_index(downstream: list[list[int]]) -> tuple[np.ndarray, np.ndarr
 
 
 def route_monthly(local_q: np.ndarray, downstream: list[list[int]]) -> np.ndarray:
-    """Route local inflow through DAG with mass conservation at bifurcations.
-
-    Prior behavior added full upstream flow to every downstream branch, which
-    duplicates water at splits and can explode at split/rejoin regions.
-    This version splits upstream discharge equally across outgoing branches.
-    """
     q = local_q.copy()
     for i in range(len(q)):
         qi = q[i]
         if qi == 0.0:
             continue
-        ds = downstream[i]
-        n_ds = len(ds)
-        if n_ds == 0:
-            continue
-        share = qi / float(n_ds)
-        for j in ds:
-            q[j] += share
+        for j in downstream[i]:
+            q[j] += qi
     return q
 
 
@@ -758,20 +585,7 @@ def run_model(cfg: ModelConfig, progress_cb=None) -> None:
     )
     update_progress(42, "Gage observations loaded")
     if cfg.gage_crosswalk_file is None:
-        gage_crosswalk_df = build_gage_crosswalk_from_cp(cfg.flo_file, cp_map)
-        if gage_crosswalk_df.empty:
-            print("No gage crosswalk provided or derived: gage enforcement and calibration are skipped.")
-            print("Tip: verify .flo IDs match metadata UP_CP after removing the first two letters (and any leading zeros).")
-        else:
-            gage_obs = compile_gage_observations(
-                cfg.flo_file,
-                cfg.start_date,
-                cfg.end_date,
-                None,
-                gage_crosswalk_df=gage_crosswalk_df,
-            )
-            print(f"Derived gage crosswalk from CP metadata: {len(gage_crosswalk_df)} gages matched.")
-            print(f"Mapped gage observations: {len(gage_obs)}")
+        print("No gage crosswalk provided: gage enforcement and calibration are skipped.")
     else:
         print(f"Mapped gage observations: {len(gage_obs)}")
 
@@ -854,49 +668,8 @@ def run_model(cfg: ModelConfig, progress_cb=None) -> None:
     out.to_csv(cfg.output_file, index=False)
     print(f"Saved modeled flows: {cfg.output_file}")
 
-    seg_avg = _compute_segment_averages(out)
-    if cfg.segment_report_csv:
-        seg_csv_path = Path(cfg.segment_report_csv)
-        seg_csv_path.parent.mkdir(parents=True, exist_ok=True)
-        seg_avg.to_csv(seg_csv_path, index=False)
-        print(f"Saved segment CSV: {seg_csv_path}")
-    if cfg.segment_report_pdf:
-        seg_report = seg_avg[["COMID", "avg_flow_cms", "avg_monthly_volume_acft"]].copy()
-        seg_report["avg_flow_cms"] = seg_report["avg_flow_cms"].map(lambda x: f"{x:.4f}")
-        seg_report["avg_monthly_volume_acft"] = seg_report["avg_monthly_volume_acft"].map(lambda x: f"{x:.2f}")
-        update_progress(94, "Writing segment PDF report")
-        _write_table_pdf(seg_report, cfg.segment_report_pdf, "Average Monthly Flow and Volume by Segment")
-        print(f"Saved segment PDF: {cfg.segment_report_pdf}")
-
-    if cfg.grid_report_pdf and cfg.grid_centroids_file:
-        update_progress(95, "Aggregating gridcell totals")
-        grid_totals = _gridcell_totals(
-            flow,
-            seg_avg,
-            cfg.grid_centroids_file,
-            cfg.grid_cell_miles,
-        )
-        if cfg.grid_report_csv:
-            grid_csv_path = Path(cfg.grid_report_csv)
-            grid_csv_path.parent.mkdir(parents=True, exist_ok=True)
-            grid_totals.to_csv(grid_csv_path, index=False)
-            print(f"Saved gridcell CSV: {grid_csv_path}")
-        grid_report = grid_totals[
-            ["FID", "Latitude", "Longitude", "total_avg_monthly_volume_acft"]
-        ].copy()
-        grid_report["total_avg_monthly_volume_acft"] = grid_report[
-            "total_avg_monthly_volume_acft"
-        ].map(lambda x: f"{x:.2f}")
-        update_progress(96, "Writing gridcell PDF report")
-        _write_table_pdf(
-            grid_report,
-            cfg.grid_report_pdf,
-            "Total Average Monthly Stream Volume by 1-Sq-Mile Grid Cell",
-        )
-        print(f"Saved gridcell PDF: {cfg.grid_report_pdf}")
-
     if cfg.output_shapefile:
-        update_progress(97, "Writing shapefile output")
+        update_progress(96, "Writing shapefile output")
         shp_date = pd.Timestamp(cfg.shapefile_date) if cfg.shapefile_date else pd.Timestamp(dates[-1])
         shp_rows = out[out["date"] == shp_date].copy()
         if shp_rows.empty:
@@ -946,12 +719,6 @@ def parse_args() -> ModelConfig:
     p.add_argument("--output-file", default="modeled_monthly_comid_flows.csv")
     p.add_argument("--output-shapefile", default=None)
     p.add_argument("--shapefile-date", default=None, help="YYYY-MM-01 month to export as shapefile")
-    p.add_argument("--segment-report-pdf", default="avg_monthly_segment_volume.pdf")
-    p.add_argument("--grid-report-pdf", default="avg_monthly_gridcell_volume.pdf")
-    p.add_argument("--segment-report-csv", default="avg_monthly_segment_volume.csv")
-    p.add_argument("--grid-report-csv", default="avg_monthly_gridcell_volume.csv")
-    p.add_argument("--grid-centroids-file", default="inputData/Centroids_HillCountry.csv")
-    p.add_argument("--grid-cell-miles", type=float, default=1.0)
     p.add_argument("--start-date", default="2010-01-01")
     p.add_argument("--end-date", default="2024-12-01")
     p.add_argument("--runoff-coeff-m-per-month", type=float, default=0.0008)
@@ -970,12 +737,6 @@ def parse_args() -> ModelConfig:
         output_file=a.output_file,
         output_shapefile=a.output_shapefile,
         shapefile_date=a.shapefile_date,
-        segment_report_pdf=(a.segment_report_pdf or None),
-        grid_report_pdf=(a.grid_report_pdf or None),
-        segment_report_csv=(a.segment_report_csv or None),
-        grid_report_csv=(a.grid_report_csv or None),
-        grid_centroids_file=(a.grid_centroids_file or None),
-        grid_cell_miles=a.grid_cell_miles,
         start_date=a.start_date,
         end_date=a.end_date,
         runoff_coeff_m_per_month=a.runoff_coeff_m_per_month,

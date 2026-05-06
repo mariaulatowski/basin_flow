@@ -15,5 +15,3 @@ dependencies:
   - shapely
   - pyproj
   - gdal
-  - matplotlib
-  - folium

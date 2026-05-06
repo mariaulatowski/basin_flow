@@ -97,9 +97,9 @@ class WAMApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Regional Streamflow Model")
-        self.root.geometry("1200x1000")
-        self.base_width = 1200
-        self.base_height = 1000
+        self.root.geometry("1100x760")
+        self.base_width = 1100
+        self.base_height = 760
         self.canvas_width = self.base_width
         self.canvas_height = self.base_height
 
@@ -119,11 +119,6 @@ class WAMApp:
         self.output_var = tk.StringVar(value="modeled_monthly_comid_flows.csv")
         self.output_shp_var = tk.StringVar(value="modeled_monthly_comid_flows.shp")
         self.output_shp_date_var = tk.StringVar(value="2024-12-01")
-        self.segment_pdf_var = tk.StringVar(value="avg_monthly_segment_volume.pdf")
-        self.segment_csv_var = tk.StringVar(value="avg_monthly_segment_volume.csv")
-        self.grid_pdf_var = tk.StringVar(value="avg_monthly_gridcell_volume.pdf")
-        self.grid_csv_var = tk.StringVar(value="avg_monthly_gridcell_volume.csv")
-        self.grid_centroids_var = tk.StringVar(value="inputData/Centroids_HillCountry.csv")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.status_var = tk.StringVar(value="Ready")
 
@@ -208,8 +203,8 @@ class WAMApp:
 
         # Draw title + left labels directly, so no widget background rectangles.
         _ = ImageDraw.Draw(self.bg_image.copy()) if self.bg_image is not None else None
-        self.canvas.create_text(602, 36, text="Regional Streamflow Model", fill="#0b2d42", font=("Comic Sans MS", 24, "bold"))
-        self.canvas.create_text(600, 34, text="Regional Streamflow Model", fill="#eaf8ff", font=("Comic Sans MS", 24, "bold"))
+        self.canvas.create_text(552, 36, text="Regional Streamflow Model", fill="#0b2d42", font=("Comic Sans MS", 24, "bold"))
+        self.canvas.create_text(550, 34, text="Regional Streamflow Model", fill="#eaf8ff", font=("Comic Sans MS", 24, "bold"))
 
         labels = [
             "Flowline source (dir/file/gdb):",
@@ -225,19 +220,14 @@ class WAMApp:
             "Output CSV:",
             "Output shapefile (optional):",
             "Shapefile month (YYYY-MM-01):",
-            "Segment PDF report:",
-            "Segment CSV report:",
-            "Gridcell PDF report:",
-            "Gridcell CSV report:",
-            "Grid centroids CSV:",
         ]
 
-        x_label = 90
-        x_entry = 420
-        x_button = 1000
-        center_x = 600
-        y_start = 90
-        row_h = 36
+        x_label = 110
+        x_entry = 430
+        x_button = 960
+        center_x = 550
+        y_start = 100
+        row_h = 44
 
         for i, txt in enumerate(labels):
             y = y_start + i * row_h
@@ -306,11 +296,6 @@ class WAMApp:
         _ = add_entry_row(10, self.output_var, 54, browse_cmd=self._browse_output, tip="Path for modeled monthly COMID flows CSV output.")
         _ = add_entry_row(11, self.output_shp_var, 54, browse_cmd=self._browse_output_shp, tip="Optional GIS shapefile output for one selected month.")
         _ = add_entry_row(12, self.output_shp_date_var, 20, tip="Month to export to shapefile, e.g. 2024-12-01.")
-        _ = add_entry_row(13, self.segment_pdf_var, 54, browse_cmd=self._browse_segment_pdf, tip="PDF report: average monthly flow/volume by segment.")
-        _ = add_entry_row(14, self.segment_csv_var, 54, browse_cmd=self._browse_segment_csv, tip="CSV report: average monthly flow/volume by segment.")
-        _ = add_entry_row(15, self.grid_pdf_var, 54, browse_cmd=self._browse_grid_pdf, tip="PDF report: average monthly volume by 1-sq-mile grid cell.")
-        _ = add_entry_row(16, self.grid_csv_var, 54, browse_cmd=self._browse_grid_csv, tip="CSV report: average monthly volume by 1-sq-mile grid cell.")
-        _ = add_entry_row(17, self.grid_centroids_var, 54, browse_cmd=self._browse_grid_centroids, tip="Centroids CSV for gridcell aggregation.")
 
         run_btn = tk.Button(
             self.canvas,
@@ -324,18 +309,18 @@ class WAMApp:
             padx=14,
             pady=5,
         )
-        self.canvas.create_window(center_x, y_start + 18 * row_h + 6, anchor="center", window=run_btn)
+        self.canvas.create_window(center_x, y_start + 13 * row_h + 6, anchor="center", window=run_btn)
 
         progress = ttk.Progressbar(self.canvas, variable=self.progress_var, orient="horizontal", mode="determinate", length=500)
-        self.canvas.create_window(center_x, y_start + 19 * row_h + 6, anchor="center", window=progress)
+        self.canvas.create_window(center_x, y_start + 14 * row_h + 6, anchor="center", window=progress)
 
         status_label = tk.Label(self.canvas, textvariable=self.status_var, fg="white", bg="#143f5f", font=("Comic Sans MS", 10, "bold"))
-        self.canvas.create_window(center_x, y_start + 20 * row_h - 8, anchor="center", window=status_label)
+        self.canvas.create_window(center_x, y_start + 15 * row_h - 8, anchor="center", window=status_label)
 
         self.processing_label = tk.Label(self.canvas, bg="#143f5f")
         if self.processing_photo is not None:
             self.processing_label.configure(image=self.processing_photo)
-        self.processing_window = self.canvas.create_window(center_x, y_start + 16 * row_h + 12, anchor="center", window=self.processing_label)
+        self.processing_window = self.canvas.create_window(center_x, y_start + 11 * row_h + 12, anchor="center", window=self.processing_label)
         self.canvas.itemconfigure(self.processing_window, state="hidden")
         self.canvas.bind("<Configure>", self._on_canvas_resize)
 
@@ -352,13 +337,9 @@ class WAMApp:
         self.canvas_height = event.height
 
         if self.bg_source_image is not None and self.bg_canvas_item is not None:
-            try:
-                resized = self.bg_source_image.resize((event.width, event.height))
-                self.bg_photo = ImageTk.PhotoImage(resized)
-                self.canvas.itemconfigure(self.bg_canvas_item, image=self.bg_photo)
-            except Exception:
-                # Safely ignore pixmap errors on some Tk builds.
-                return
+            resized = self.bg_source_image.resize((event.width, event.height))
+            self.bg_photo = ImageTk.PhotoImage(resized)
+            self.canvas.itemconfigure(self.bg_canvas_item, image=self.bg_photo)
 
     def _browse_flowline(self) -> None:
         pick_dir = messagebox.askyesno(
@@ -451,50 +432,6 @@ class WAMApp:
         if path:
             self.output_shp_var.set(path)
 
-    def _browse_segment_pdf(self) -> None:
-        path = filedialog.asksaveasfilename(
-            title="Save segment PDF report as",
-            defaultextension=".pdf",
-            filetypes=[("PDF", "*.pdf"), ("All files", "*.*")],
-        )
-        if path:
-            self.segment_pdf_var.set(path)
-
-    def _browse_segment_csv(self) -> None:
-        path = filedialog.asksaveasfilename(
-            title="Save segment CSV report as",
-            defaultextension=".csv",
-            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
-        )
-        if path:
-            self.segment_csv_var.set(path)
-
-    def _browse_grid_pdf(self) -> None:
-        path = filedialog.asksaveasfilename(
-            title="Save gridcell PDF report as",
-            defaultextension=".pdf",
-            filetypes=[("PDF", "*.pdf"), ("All files", "*.*")],
-        )
-        if path:
-            self.grid_pdf_var.set(path)
-
-    def _browse_grid_csv(self) -> None:
-        path = filedialog.asksaveasfilename(
-            title="Save gridcell CSV report as",
-            defaultextension=".csv",
-            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
-        )
-        if path:
-            self.grid_csv_var.set(path)
-
-    def _browse_grid_centroids(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select grid centroids CSV",
-            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
-        )
-        if path:
-            self.grid_centroids_var.set(path)
-
     def _run(self) -> None:
         try:
             self.progress_var.set(0.0)
@@ -510,11 +447,6 @@ class WAMApp:
             basin_name = self.basin_name_var.get().strip()
             output = self.output_var.get().strip()
             output_shp = self.output_shp_var.get().strip() or None
-            seg_pdf = self.segment_pdf_var.get().strip() or None
-            seg_csv = self.segment_csv_var.get().strip() or None
-            grid_pdf = self.grid_pdf_var.get().strip() or None
-            grid_csv = self.grid_csv_var.get().strip() or None
-            grid_centroids = self.grid_centroids_var.get().strip() or None
 
             if not flowline_raw or not cp_meta or not flo or not basin or not basin_name or not output:
                 raise ValueError("Missing required input.")
@@ -540,11 +472,6 @@ class WAMApp:
                 output_file=output,
                 output_shapefile=output_shp,
                 shapefile_date=(self.output_shp_date_var.get().strip() or None),
-                segment_report_pdf=seg_pdf,
-                grid_report_pdf=grid_pdf,
-                segment_report_csv=seg_csv,
-                grid_report_csv=grid_csv,
-                grid_centroids_file=grid_centroids,
                 start_date=f"{start_year}-01-01",
                 end_date=f"{end_year}-12-01",
                 gage_crosswalk_file=gage_crosswalk,
