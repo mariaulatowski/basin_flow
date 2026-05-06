@@ -1,0 +1,70 @@
+"""Read PRISM precipitation for an HSR/THS water year."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+import pandas as pd
+
+
+@dataclass
+class PrismPrecResult:
+    wy: int
+    ths: str
+    prism_raw: pd.DataFrame
+    prism_ths: pd.DataFrame
+    gridcode_ths: np.ndarray
+    comid_ths: np.ndarray
+    unmatched_gridcodes: np.ndarray
+
+
+def read_prism_prec(
+    base_dir: Path | str,
+    ths: str,
+    wy: int,
+    comid_ths_flowline: Iterable[int],
+    gridcode_ths_nlcd: Iterable[int] | None = None,
+) -> PrismPrecResult:
+    base_dir = Path(base_dir)
+    hsr = f"HSR{ths[:2]}00"
+    prism_path = base_dir / hsr / "PRISM" / "Precipitation" / f"PrismPrecipWY{wy}.dat"
+    xwalk_path = base_dir / hsr / "Flowlines" / "GridCodeComID.txt"
+
+    if not prism_path.exists():
+        raise FileNotFoundError(f"Missing PRISM file: {prism_path}")
+    if not xwalk_path.exists():
+        raise FileNotFoundError(f"Missing GridCode/ComID file: {xwalk_path}")
+
+    col_names = ["GridCode", "GCAreaSqMi"] + [f"PIn_{i:02d}" for i in range(1, 14)]
+    prism_raw = pd.read_csv(prism_path, sep=r"\s+", skiprows=4, header=None, names=col_names)
+
+    gridcode_comid = pd.read_csv(xwalk_path, skiprows=1, header=None, names=["GridCode", "ComID"])
+    comid_ths_flowline = np.asarray(list(comid_ths_flowline), dtype=np.int64)
+
+    xwalk_match = gridcode_comid[gridcode_comid["ComID"].isin(comid_ths_flowline)].copy()
+    comid_ths = np.sort(xwalk_match["ComID"].unique())
+    gridcode_ths = xwalk_match["GridCode"].to_numpy(dtype=np.int64)
+
+    prism_ths = prism_raw[prism_raw["GridCode"].isin(gridcode_ths)].copy()
+    prism_ths = prism_ths.sort_values("GridCode").reset_index(drop=True)
+
+    matched_gridcodes = prism_ths["GridCode"].to_numpy(dtype=np.int64)
+    expected_gridcodes = np.sort(np.unique(gridcode_ths))
+    unmatched_gridcodes = np.setxor1d(matched_gridcodes, expected_gridcodes)
+
+    if gridcode_ths_nlcd is not None:
+        nlcd_codes = np.asarray(list(gridcode_ths_nlcd), dtype=np.int64)
+        prism_ths = prism_ths.set_index("GridCode").reindex(nlcd_codes).reset_index()
+
+    return PrismPrecResult(
+        wy=wy,
+        ths=ths,
+        prism_raw=prism_raw,
+        prism_ths=prism_ths,
+        gridcode_ths=np.asarray(expected_gridcodes, dtype=np.int64),
+        comid_ths=comid_ths,
+        unmatched_gridcodes=unmatched_gridcodes,
+    )

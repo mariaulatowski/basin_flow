@@ -1,0 +1,159 @@
+"""
+AFConFlowAccum — Python translation of MATLAB AFConFlowAccum.
+
+Accumulates constrained incremental monthly flows through the NHD network
+using HydroSeq routing logic, then writes yearly ComID accumulated flows.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+MONTH_ABBREV = ["Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep"]
+
+
+def con_flow_accum(
+	base_dir: Path | str,
+	hsr: str,
+	iy: int,
+	wy1: int,
+	sta_hist: Sequence[Dict[str, Any]],
+	month_name: Sequence[str],
+	plot_debug: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+	"""Accumulate constrained adjusted flows through the NHDPlus network.
+
+	Parameters
+	----------
+	base_dir:
+		Root directory containing HSR folders.
+	hsr:
+		Hydrologic subregion folder name.
+	iy:
+		0-based water-year index.
+	wy1:
+		First water year.
+	sta_hist:
+		Station history sequence; ``sta_hist[iy]`` must include
+		``StaList`` and ``QTotWY``.
+	month_name:
+		12-element month labels.
+	plot_debug:
+		Reserved flag for optional debug plotting (kept false by default).
+
+	Returns
+	-------
+	comid_vaa, flow_accum:
+		ComIDs in HydroSeq-sorted order and accumulated monthly flows
+		shape ``(Nx, 12)``.
+	"""
+	_ = plot_debug  # placeholder to preserve MATLAB switch intent
+	wy = wy1 + iy
+	base = Path(base_dir)
+
+	# Read VAA table (expects at least columns: ComID,FromNode,ToNode,HydroSeq,Divergence,StartFlag)
+	vaa_path = base / hsr / "GIS" / "NHDFlowlineVAA.txt"
+	x = pd.read_csv(vaa_path, header=0)
+	if x.shape[1] < 6:
+		raise ValueError("NHDFlowlineVAA.txt must contain at least 6 columns.")
+
+	x = x.sort_values(x.columns[0]).reset_index(drop=True)
+	comid_vaa_asc = x.iloc[:, 0].to_numpy(dtype=np.int64)
+	nx = len(x)
+	flow_accum = np.zeros((nx, 12), dtype=float)
+
+	# Read constrained catchment flows previously written by AFWrtQYEstCon
+	qy_path = base / hsr / "Output" / "FlowYield" / f"QY{hsr}WY{wy}.csv"
+	y = pd.read_csv(qy_path)
+
+	# Read annual water use data by ComID (12 monthly columns)
+	wu_path = base / hsr / "WaterUse" / "ComID_WU_All.dat"
+	wu_df = pd.read_csv(wu_path, sep=r"\s+", header=None)
+	if wu_df.shape[1] < 13:
+		raise ValueError("ComID_WU_All.dat must contain ComID + 12 month columns.")
+	wu_comid = wu_df.iloc[:, 0].to_numpy(dtype=np.int64)
+	wu = wu_df.iloc[:, 1:13].to_numpy(dtype=float)
+
+	# Station-to-ComID lookup for diagnostics
+	station_map_path = base / f"{hsr[:5]}00" / "Flowlines" / "StationComID.csv"
+	stacomid_df = pd.read_csv(station_map_path)
+	hr_sta_id = stacomid_df.iloc[:, 0].astype(str).str.strip().to_numpy()
+	hr_comid = stacomid_df.iloc[:, 1].to_numpy(dtype=np.int64)
+
+	for im in range(12):
+		# Match VAA ComIDs to constrained monthly catchment flows QConAdj*
+		month_col = f"QConAdj{MONTH_ABBREV[im]}"
+		if month_col not in y.columns:
+			raise ValueError(f"Missing column {month_col} in {qy_path.name}.")
+
+		y_comid = y["ComID"].to_numpy(dtype=np.int64)
+		y_qcon = y[month_col].to_numpy(dtype=float)
+
+		y_map = {int(c): float(q) for c, q in zip(y_comid, y_qcon)}
+		incre_flow = np.array([y_map.get(int(c), 0.0) for c in comid_vaa_asc], dtype=float)
+
+		x_aug = x.copy()
+		x_aug["IncreFlow"] = incre_flow
+		x_aug = x_aug.sort_values(x_aug.columns[3], ascending=False).reset_index(drop=True)
+
+		comid_vaa = x_aug.iloc[:, 0].to_numpy(dtype=np.int64)
+		from_node = x_aug.iloc[:, 1].to_numpy()
+		to_node = x_aug.iloc[:, 2].to_numpy()
+		hydro_seq = x_aug.iloc[:, 3].to_numpy()
+		divergence = x_aug.iloc[:, 4].to_numpy()
+		start_flag = x_aug.iloc[:, 5].to_numpy()
+		incre_flow_sorted = x_aug["IncreFlow"].to_numpy(dtype=float)
+
+		# Initialize month with negative withdrawals (same convention as MATLAB).
+		flow_accum[:, im] = 0.0
+		comid_to_idx = {int(c): i for i, c in enumerate(comid_vaa)}
+		for iw, comid in enumerate(wu_comid):
+			idx = comid_to_idx.get(int(comid))
+			if idx is not None:
+				flow_accum[idx, im] = -wu[iw, im]
+
+		# HydroSeq routing algorithm
+		for ix in range(nx):
+			if hydro_seq[ix] <= 0:
+				continue
+			if int(start_flag[ix]) == 1 or int(divergence[ix]) == 2:
+				flow_accum[ix, im] = incre_flow_sorted[ix]
+			else:
+				ndx = np.flatnonzero(to_node == from_node[ix])
+				flow_accum[ix, im] = float(np.sum(flow_accum[ndx, im]) + incre_flow_sorted[ix])
+
+		# Per-station diagnostics against measured monthly flows
+		sta_list = sta_hist[iy]["StaList"]
+		q_tot_wy = np.asarray(sta_hist[iy]["QTotWY"], dtype=float)
+		for is_idx, sta in enumerate(sta_list):
+			sta_id = str(sta).strip()
+			ndx = np.flatnonzero(hr_sta_id == sta_id)
+			if len(ndx) == 0:
+				continue
+			comid_target = int(hr_comid[ndx[0]])
+			comid_ndx = comid_to_idx.get(comid_target)
+			if comid_ndx is None:
+				continue
+			acc_sta_flow = flow_accum[comid_ndx, im]
+			mea_flow = q_tot_wy[is_idx, im]
+			print(
+				f" {is_idx + 1:4d} {wy:4d} {month_name[im][:3]:>4s} {sta:>10s} "
+				f"{int(ndx[0]) + 1:4d} {comid_target:10d} {acc_sta_flow:7.1f} {mea_flow:7.1f}"
+			)
+
+	out_dir = base / hsr / "Output" / "FlowAccum"
+	out_dir.mkdir(parents=True, exist_ok=True)
+	out_path = out_dir / f"ComIDQ12WY{wy}.csv"
+	print(f"Writing output file: {out_path}")
+
+	out_df = pd.DataFrame({"ComIDVAA": comid_vaa})
+	for im in range(12):
+		out_df[f"QAccCon{MONTH_ABBREV[im]}"] = flow_accum[:, im]
+	out_df.to_csv(out_path, index=False)
+
+	return comid_vaa, flow_accum

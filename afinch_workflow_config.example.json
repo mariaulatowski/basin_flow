@@ -1,0 +1,14 @@
+{
+  "start_date": "2018-01-01",
+  "end_date": "2018-01-01",
+  "network_source": "nhd_medium",
+  "output_dir": "output/nhd_medium_usgs_wam",
+  "usgs_trust": 1.0,
+  "wam_trust": 0.75,
+  "afinch_iters": 8,
+  "afinch_damping": 0.9,
+  "max_output_cms": 10000.0,
+  "map_year": 2018,
+  "map_month": 1,
+  "skip_map": false
+}

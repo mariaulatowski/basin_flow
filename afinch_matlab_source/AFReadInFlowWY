@@ -1,0 +1,160 @@
+"""
+Appendix: AFReadInFlowWY
+
+Python translation of MATLAB workflow:
+1. Read monthly flows at active gaging stations for WY.
+2. Mark POA active stations.
+3. Print station flow diagnostics.
+4. Read water-use series by ComID and map to THS reach order.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+@dataclass
+class FlowWYResult:
+    poa: np.ndarray
+    station_flow_df: pd.DataFrame
+    station_flow_ths_df: pd.DataFrame
+    reach_wu: np.ndarray
+    comid_wu_df: pd.DataFrame
+
+
+def _month_cols(prefix: str, n: int) -> list[str]:
+    return [f"{prefix}{i:02d}" for i in range(1, n + 1)]
+
+
+def read_in_flow_wy(
+    base_dir: Path,
+    ths: str,
+    hsr: str,
+    wy: int,
+    iy: int,
+    sta_ths: list[str],
+    poa: np.ndarray,
+    comid_ths: np.ndarray,
+    n_reaches: int,
+) -> FlowWYResult:
+    """
+    Read streamflow and water-use inputs for a single water year.
+
+    Parameters
+    ----------
+    base_dir
+        Base folder containing HSR directories.
+    ths
+        Target hydrologic subregion code (4-digit).
+    hsr
+        Hydrologic subregion folder key, e.g. HSR1207.
+    wy
+        Water year.
+    iy
+        1-based year index in Period of Analysis.
+    sta_ths
+        Station IDs in THS StationList order.
+    poa
+        Period-of-analysis matrix, shape (NStaTHS, Ny).
+    comid_ths
+        THS ComIDs in model reach order.
+    n_reaches
+        Number of THS reaches for ReachWU array allocation.
+    """
+    print("\nAFReadInFlowWY: Reading in flows at gaging stations and water-use flows at specified reaches.")
+
+    flow_file = base_dir / f"HSR{ths[:2]}00" / "Streamflow" / f"ComIDStationDAMoAnQ{wy}.dat"
+    if not flow_file.exists():
+        raise FileNotFoundError(f"Missing streamflow file: {flow_file}")
+
+    # MATLAB read format: %u %s + 14 floats (area + 13 q values)
+    q_cols = _month_cols("Q", 13)
+    flow_cols = ["ComIDSta", "StaWY", "NWISArea"] + q_cols
+    station_flow_df = pd.read_csv(flow_file, sep=r"\s+", header=None, names=flow_cols)
+    station_flow_df["StaWY"] = station_flow_df["StaWY"].astype(str)
+
+    # Intersect StaWY with StaTHS preserving StaTHS index usage for POA(ib,iy)=1
+    sta_ths_series = pd.Series(sta_ths, name="StaTHS")
+    sta_map = pd.DataFrame({"StaTHS": sta_ths_series, "ib": np.arange(len(sta_ths), dtype=int)})
+    station_flow_ths_df = station_flow_df.merge(sta_map, left_on="StaWY", right_on="StaTHS", how="inner")
+
+    if iy < 1 or iy > poa.shape[1]:
+        raise ValueError(f"iy={iy} out of POA column bounds 1..{poa.shape[1]}")
+    poa_idx = station_flow_ths_df["ib"].to_numpy(dtype=int)
+    poa[poa_idx, iy - 1] = 1
+
+    # Print station flow info (Oct-Sep from Q01..Q12)
+    print(f"\nFlows at Gaging Stations in Hydrologic Subregion {ths} for Water Year {wy}")
+    print(" " + "-" * 82)
+    print(" Index Gaging Drainage")
+    print(" Loop Station Area (mi2) Oct Nov Dec Jan Feb Mar")
+    print(" THS Apr May Jun Jul Aug Sep")
+    print(" " + "-" * 82)
+
+    ordered = station_flow_ths_df.reset_index(drop=True)
+    for i, row in ordered.iterrows():
+        idx = i + 1
+        vals = [float(row[f"Q{m:02d}"]) for m in range(1, 13)]
+        print(
+            f" {idx:3d} {row['StaWY']} {float(row['NWISArea']):7.1f} "
+            + " ".join(f"{v:9.1f}" for v in vals[:6])
+        )
+        print(f" {idx:3d} " + " ".join(f"{v:9.1f}" for v in vals[6:12]))
+
+        # Only reject a true duplicate station row, not two different stations that happen
+        # to share the same monthly flow vector.
+        if idx > 1:
+            prev = ordered.iloc[i - 1]
+            prev_vec = np.array([float(prev[f"Q{m:02d}"]) for m in range(1, 14)], dtype=float)
+            curr_vec = np.array([float(row[f"Q{m:02d}"]) for m in range(1, 14)], dtype=float)
+            if (
+                str(prev["StaWY"]).strip() == str(row["StaWY"]).strip()
+                and int(prev["ComIDSta"]) == int(row["ComIDSta"])
+                and np.array_equal(curr_vec, prev_vec)
+            ):
+                raise ValueError(f"Duplicate station flow vectors detected at station {row['StaWY']}")
+
+    # Water use
+    print(f"Initializing zero flows in all {n_reaches} reaches and all months within the THS.")
+    reach_wu = np.zeros((n_reaches, 12), dtype=float)
+
+    wu_file = base_dir / hsr / "WaterUse" / "ComID_WU_All.dat"
+    if not wu_file.exists():
+        raise FileNotFoundError(f"Missing water-use file: {wu_file}")
+
+    wu_cols = ["ComID_WU"] + _month_cols("WU", 12)
+    comid_wu_df = pd.read_csv(wu_file, sep=r"\s+", header=None, names=wu_cols)
+
+    ths_comid_df = pd.DataFrame({"ComID_THS": np.asarray(comid_ths, dtype=np.int64), "bi": np.arange(n_reaches)})
+    wu_join = comid_wu_df.merge(ths_comid_df, left_on="ComID_WU", right_on="ComID_THS", how="inner")
+
+    print(f"\nWater Use in CFS within THS {ths} (negative indicates withdrawal from reach).")
+    print(" " + "-" * 82)
+    print(" ComID Oct Nov Dec Jan Feb Mar Apr May Jun Jul Aug Sep")
+    print(" " + "-" * 82)
+    for _, row in wu_join.iterrows():
+        vals = [float(row[f"WU{m:02d}"]) for m in range(1, 13)]
+        print(f" {int(row['ComID_WU']):8d} " + "".join(f"{v:6.1f}" for v in vals))
+    print(" " + "-" * 82)
+
+    # Map WU rows into THS reach order
+    bi = wu_join["bi"].to_numpy(dtype=int)
+    wu_vals = wu_join[_month_cols("WU", 12)].to_numpy(dtype=float)
+    reach_wu[bi, :] = wu_vals
+
+    return FlowWYResult(
+        poa=poa,
+        station_flow_df=station_flow_df,
+        station_flow_ths_df=station_flow_ths_df,
+        reach_wu=reach_wu,
+        comid_wu_df=comid_wu_df,
+    )
+
+
+if __name__ == "__main__":
+    # Example placeholder only.
+    _ = None

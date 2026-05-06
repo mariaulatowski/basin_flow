@@ -1,0 +1,305 @@
+"""
+AFRegressPOA — Python translation of MATLAB AFRegressPOA.
+
+Builds a concatenated period-of-analysis regression matrix, performs
+month-by-month stepwise regression for incremental adjusted water yield,
+and plots t-values for selected parameters.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Sequence
+
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+import numpy as np
+import statsmodels.api as sm
+
+
+@dataclass
+class RegressionStats:
+	df0: int
+	dfe: int
+	rmse: float
+	fstat: float
+	pval: float
+	SSresid: float
+	SStotal: float
+
+
+@dataclass
+class MonthlyRegressionResult:
+	b: np.ndarray
+	se: np.ndarray
+	pval: np.ndarray
+	inmodel: np.ndarray
+	stats: RegressionStats
+
+
+@dataclass
+class RegressPOAResult:
+	p_enter: float
+	p_remove: float
+	reg_mat: np.ndarray
+	reg_month: List[MonthlyRegressionResult]
+	t_values: np.ndarray
+
+
+def _prompt_pvalues(prompt_fn: Callable[[], tuple[float, float]] | None) -> tuple[float, float]:
+	if prompt_fn is None:
+		return 0.01, 0.01
+	return prompt_fn()
+
+
+def _stepwise_fit(
+	x: np.ndarray,
+	y: np.ndarray,
+	p_enter: float,
+	p_remove: float,
+) -> MonthlyRegressionResult:
+	mask = np.isfinite(y) & np.all(np.isfinite(x), axis=1)
+	x = np.asarray(x[mask], dtype=float)
+	y = np.asarray(y[mask], dtype=float)
+
+	if len(y) == 0:
+		n_features = x.shape[1] if x.ndim == 2 else 0
+		return MonthlyRegressionResult(
+			b=np.zeros(n_features, dtype=float),
+			se=np.full(n_features, np.nan, dtype=float),
+			pval=np.full(n_features, np.nan, dtype=float),
+			inmodel=np.zeros(n_features, dtype=bool),
+			stats=RegressionStats(df0=0, dfe=0, rmse=np.nan, fstat=np.nan, pval=np.nan, SSresid=0.0, SStotal=0.0),
+		)
+
+	n_features = x.shape[1]
+	included: List[int] = []
+	changed = True
+
+	while changed:
+		changed = False
+
+		# Forward step.
+		excluded = [idx for idx in range(n_features) if idx not in included]
+		best_idx = None
+		best_p = np.inf
+		for idx in excluded:
+			cols = included + [idx]
+			model = sm.OLS(y, sm.add_constant(x[:, cols], has_constant="add")).fit()
+			pval = float(model.pvalues[-1])
+			if pval < best_p:
+				best_p = pval
+				best_idx = idx
+		if best_idx is not None and best_p <= p_enter:
+			included.append(best_idx)
+			changed = True
+
+		# Backward step.
+		while included:
+			model = sm.OLS(y, sm.add_constant(x[:, included], has_constant="add")).fit()
+			pvals = model.pvalues[1:]
+			worst_local = int(np.argmax(pvals))
+			worst_p = float(pvals[worst_local])
+			if worst_p > p_remove:
+				included.pop(worst_local)
+				changed = True
+			else:
+				break
+
+	inmodel = np.zeros(n_features, dtype=bool)
+	b = np.zeros(n_features, dtype=float)
+	se = np.full(n_features, np.nan, dtype=float)
+	pvals = np.full(n_features, np.nan, dtype=float)
+
+	if included:
+		final = sm.OLS(y, sm.add_constant(x[:, included], has_constant="add")).fit()
+		inmodel[included] = True
+		b[included] = final.params[1:]
+		se[included] = final.bse[1:]
+		pvals[included] = final.pvalues[1:]
+		ss_resid = float(np.sum(final.resid ** 2))
+		ss_total = float(np.sum((y - np.mean(y)) ** 2))
+		stats = RegressionStats(
+			df0=len(included),
+			dfe=int(final.df_resid),
+			rmse=float(np.sqrt(final.mse_resid)) if final.df_resid > 0 else np.nan,
+			fstat=float(final.fvalue) if final.fvalue is not None else np.nan,
+			pval=float(final.f_pvalue) if final.f_pvalue is not None else np.nan,
+			SSresid=ss_resid,
+			SStotal=ss_total,
+		)
+	else:
+		ss_total = float(np.sum((y - np.mean(y)) ** 2))
+		ss_resid = float(np.sum((y - np.mean(y)) ** 2))
+		stats = RegressionStats(
+			df0=0,
+			dfe=max(0, len(y) - 1),
+			rmse=float(np.sqrt(ss_resid / max(1, len(y) - 1))),
+			fstat=np.nan,
+			pval=np.nan,
+			SSresid=ss_resid,
+			SStotal=ss_total,
+		)
+
+	return MonthlyRegressionResult(b=b, se=se, pval=pvals, inmodel=inmodel, stats=stats)
+
+
+def _previous_month_precip(
+	afstruct: Dict[str, Any],
+	hsr: str,
+	sta_hist: Sequence[Dict[str, Any]],
+	prsm_prec_ths: np.ndarray,
+	p_in0: np.ndarray,
+	iy: int,
+	is_idx: int,
+	im: int,
+) -> float:
+	sta_ndx = int(sta_hist[iy]["StaNdx"][is_idx])
+	station = afstruct[hsr][iy][sta_ndx]
+
+	if im > 0:
+		return float(station["Precip"][im - 1])
+
+	if iy == 0:
+		denom = float(np.mean(prsm_prec_ths[iy, :, im]))
+		scale = float(np.mean(p_in0[:, 11])) / denom if denom != 0 else 0.0
+		return float(station["Precip"][im] * scale)
+
+	prev_sta_ndx = np.asarray(sta_hist[iy - 1]["StaNdx"], dtype=int)
+	prev_names = [afstruct[hsr][iy - 1][idx]["Station"] for idx in prev_sta_ndx]
+	if station["Station"] in prev_names:
+		prev_idx = prev_names.index(station["Station"])
+		return float(afstruct[hsr][iy - 1][prev_sta_ndx[prev_idx]]["Precip"][11])
+	return float(np.mean(prsm_prec_ths[iy - 1, :, 11]))
+
+
+def _red_white_blue_cmap() -> mcolors.ListedColormap:
+	return mcolors.ListedColormap(
+		np.column_stack(
+			[
+				np.concatenate([np.ones(32), np.linspace(1, 0, 32)]),
+				np.concatenate([np.linspace(0, 1, 32), np.linspace(1, 0, 32)]),
+				np.concatenate([np.linspace(0, 1, 32), np.ones(32)]),
+			]
+		)
+	)
+
+
+def regress_poa(
+	afstruct: Dict[str, Any],
+	hsr: str,
+	sta_hist: Sequence[Dict[str, Any]],
+	wy1: int,
+	ny: int,
+	nr: int,
+	cb_matrix: np.ndarray,
+	p_in0: np.ndarray,
+	prsm_prec_ths: np.ndarray,
+	reg_var_name: Sequence[str],
+	mo_name: Sequence[str],
+	prompt_pvalues: Callable[[], tuple[float, float]] | None = None,
+	make_plot: bool = True,
+) -> RegressPOAResult:
+	"""Run period-of-analysis monthly stepwise regressions."""
+	p_enter, p_remove = _prompt_pvalues(prompt_pvalues)
+
+	ndx_nlcd = np.flatnonzero(np.sum(cb_matrix[:, :21], axis=1))
+	ndx_prsm = np.flatnonzero(np.sum(cb_matrix[:, 21:24], axis=1))
+	print(
+		f"\nThe specified regression contains {len(ndx_nlcd)} NLCD and {len(ndx_prsm)} climatic components.\n"
+	)
+
+	n_sta_total = sum(int(hist["NStaAct"]) for hist in sta_hist[:ny])
+	n_row = n_sta_total * 12
+	n_col = 4 + nr
+	reg_mat = np.zeros((n_row, n_col), dtype=float)
+
+	row = 0
+	for iy in range(ny):
+		wy = wy1 + iy
+		n_act_sta = int(sta_hist[iy]["NStaAct"])
+		for is_idx in range(n_act_sta):
+			station_id = str(sta_hist[iy]["StaList"][is_idx]).strip()
+			try:
+				station_num = float(station_id)
+			except ValueError:
+				station_num = float(is_idx + 1)
+			sta_ndx = int(sta_hist[iy]["StaNdx"][is_idx])
+			station = afstruct[hsr][iy][sta_ndx]
+
+			for im in range(12):
+				reg_mat[row, 0] = wy
+				reg_mat[row, 1] = station_num
+				reg_mat[row, 2] = im + 1
+				reg_mat[row, 3] = float(sta_hist[iy]["YAdjIncWY"][is_idx, im])
+
+				for ir in range(nr):
+					prec = 0.0
+					if cb_matrix[ir, 23] == 1:
+						prec = _previous_month_precip(
+							afstruct, hsr, sta_hist, prsm_prec_ths, p_in0, iy, is_idx, im
+						)
+
+					reg_mat[row, 4 + ir] = (
+						cb_matrix[ir, :21] @ np.asarray(station["NLCD"], dtype=float)
+						+ cb_matrix[ir, 21] * float(station["Precip"][im])
+						+ cb_matrix[ir, 22] * float(station["Temp"][im])
+						+ cb_matrix[ir, 23] * prec
+					)
+				row += 1
+
+	reg_month: List[MonthlyRegressionResult] = []
+	for im in range(12):
+		ndx = reg_mat[:, 2] == (im + 1)
+		x = reg_mat[ndx, 4 : 4 + nr]
+		y = reg_mat[ndx, 3]
+		reg_month.append(_stepwise_fit(x, y, p_enter=p_enter, p_remove=p_remove))
+
+	t_values = np.column_stack([
+		np.where(month.inmodel, month.b / month.se, 0.0) for month in reg_month
+	])
+
+	if make_plot:
+		fig, ax = plt.subplots(num=58, clear=True, figsize=(10, max(4, nr * 0.45)))
+		fig.canvas.manager.set_window_title(
+			f"Monthly t-values for Significant (p<={max(p_enter, p_remove):.3g}) Parameters across all Years"
+		)
+		im = ax.imshow(
+			t_values,
+			aspect="auto",
+			cmap=_red_white_blue_cmap(),
+			vmin=-10,
+			vmax=10,
+			origin="upper",
+		)
+		ax.set_yticks(range(nr))
+		ax.set_yticklabels(list(reg_var_name))
+		ax.set_xticks(range(12))
+		ax.set_xticklabels(list(mo_name))
+		ax.set_title(
+			f"Monthly t-values for Significant (p<={max(p_enter, p_remove):.3g}) Parameters for the period of analysis."
+		)
+		fig.colorbar(im, ax=ax, orientation="horizontal", pad=0.12)
+		fig.tight_layout()
+		plt.show(block=False)
+
+	ndash = 63
+	print("Monthly Regression Results for Period of Analysis")
+	print("-" * ndash)
+	print("Month explanatory_variables degrees_of_freedom RMSE F-stat p-value r2")
+	print("-" * ndash)
+	for im, month in enumerate(reg_month):
+		r2 = 1.0 - month.stats.SSresid / month.stats.SStotal if month.stats.SStotal != 0 else np.nan
+		print(
+			f"{mo_name[im]:>5} {month.stats.df0:>5} {month.stats.dfe:>8} "
+			f"{month.stats.rmse:>9.4f} {month.stats.fstat:>8.2f} {month.stats.pval:>10.5f} {r2:>6.4f}"
+		)
+	print("-" * ndash)
+
+	return RegressPOAResult(
+		p_enter=p_enter,
+		p_remove=p_remove,
+		reg_mat=reg_mat,
+		reg_month=reg_month,
+		t_values=t_values,
+	)

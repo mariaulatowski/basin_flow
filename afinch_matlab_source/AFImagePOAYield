@@ -1,0 +1,181 @@
+"""
+AFImagePOAYield — Python translation of MATLAB AFImagePOAYield.
+
+Creates a 3D image of monthly water yields at historically gaged stations
+for the period of analysis.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Sequence
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+
+def image_poa_yield(
+	base_dir: Path | str,
+	ths: str,
+	hsr: str,
+	trend_duration_matrix: Sequence[pd.DataFrame],
+	target_month: int,
+	month_name: Sequence[str],
+	wy1: int,
+	wyn: int,
+	ny: int,
+) -> dict:
+	"""Build and plot monthly yield image for gaged stations.
+
+	Parameters
+	----------
+	base_dir:
+		Project root path.
+	ths:
+		THS identifier, e.g. "1101".
+	hsr:
+		HSR folder name.
+	trend_duration_matrix:
+		Sequence of annual DataFrames, each containing ComID and 12 monthly
+		accumulated flows in columns 0..12.
+	target_month:
+		1-based water-year month index (Oct=1 ... Sep=12).
+	month_name:
+		12 month labels.
+	wy1, wyn, ny:
+		Water-year metadata.
+	"""
+	base = Path(base_dir)
+	if target_month < 1 or target_month > 12:
+		raise ValueError("target_month must be in 1..12")
+
+	station_comid_path = base / f"HSR{ths[:2]}00" / "Flowlines" / "StationComID.csv"
+	sta_map = pd.read_csv(station_comid_path)
+	station_all = sta_map.iloc[:, 0].astype(str).str.strip().to_list()
+	station_comid_all = sta_map.iloc[:, 1].to_numpy(dtype=np.int64)
+
+	station_list_path = base / hsr / "GagedCatchments" / "StationList.txt"
+	station_ths = pd.read_csv(station_list_path, header=None).iloc[:, 0].astype(str).str.strip().to_list()
+
+	ns = len(station_ths)
+	comid_ths = np.zeros(ns, dtype=np.int64)
+	for is_idx, sta in enumerate(station_ths):
+		ndx = next((i for i, v in enumerate(station_all) if v == sta), None)
+		if ndx is None:
+			raise ValueError(f"Station {sta} not found in StationComID.csv")
+		comid_ths[is_idx] = int(station_comid_all[ndx])
+		print(f"{is_idx + 1:4.0f} {sta} {ndx + 1:6.0f} {comid_ths[is_idx]:12.0f}")
+
+	da_path = base / f"HSR{ths[:2]}00" / "Streamflow" / "StationDASqMi.csv"
+	da_df = pd.read_csv(da_path)
+	sta_all = da_df.iloc[:, 0].astype(str).str.strip().to_numpy()
+	da_sq_mi = da_df.iloc[:, 1].to_numpy(dtype=float)
+
+	det = da_sq_mi > 0
+	sta_all = sta_all[det]
+	da_sq_mi = da_sq_mi[det]
+
+	da_sq_mi_ths = np.zeros(ns, dtype=float)
+	for is_idx, sta in enumerate(station_ths):
+		ndx = np.flatnonzero(sta_all == sta)
+		if len(ndx) == 0:
+			da_sq_mi_ths[is_idx] = np.nan
+			continue
+		da_sq_mi_ths[is_idx] = da_sq_mi[int(ndx[0])]
+		print(f"{is_idx + 1:4.0f} {sta_all[int(ndx[0])]} {int(ndx[0]) + 1:4.0f} {da_sq_mi_ths[is_idx]:5.2f}")
+
+	first_year = trend_duration_matrix[0]
+	flow_comid = np.intersect1d(comid_ths, first_year.iloc[:, 0].to_numpy(dtype=np.int64))
+	nt = len(flow_comid)
+
+	station_tdm = []
+	da_sq_mi_tdm = np.zeros(nt, dtype=float)
+	comid_tdm = np.zeros(nt, dtype=np.int64)
+	for it, cid in enumerate(flow_comid):
+		ndx = np.flatnonzero(comid_ths == cid)
+		if len(ndx) == 0:
+			continue
+		ref = int(ndx[-1])
+		station_tdm.append(station_ths[ref])
+		da_sq_mi_tdm[it] = da_sq_mi_ths[ref]
+		comid_tdm[it] = comid_ths[ref]
+
+	q = np.zeros((ny, nt, 12), dtype=float)
+	y = np.zeros((ny, nt, 12), dtype=float)
+
+	comid_to_t = {int(c): i for i, c in enumerate(comid_tdm)}
+	for iy in range(ny):
+		df = trend_duration_matrix[iy]
+		year_comid = df.iloc[:, 0].to_numpy(dtype=np.int64)
+		year_q = df.iloc[:, 1:13].to_numpy(dtype=float)
+		for row_idx, cid in enumerate(year_comid):
+			it = comid_to_t.get(int(cid))
+			if it is None:
+				continue
+			q[iy, it, :] = year_q[row_idx, :]
+			if da_sq_mi_tdm[it] > 0:
+				y[iy, it, :] = q[iy, it, :] / da_sq_mi_tdm[it]
+			else:
+				y[iy, it, :] = np.nan
+
+	month_idx = target_month - 1
+	z = y[:, :, month_idx]
+
+	fig = plt.figure(num=300, figsize=(12, 9), clear=True)
+	fig.canvas.manager.set_window_title("Monthly Water Yields at Gaging Stations During the Period of Analysis")
+	ax = fig.add_subplot(111, projection="3d")
+
+	ny_idx, nt_idx = np.indices(z.shape)
+	xpos = nt_idx.ravel()
+	ypos = ny_idx.ravel()
+	zpos = np.zeros_like(xpos, dtype=float)
+	dx = 0.7 * np.ones_like(xpos, dtype=float)
+	dy = 0.7 * np.ones_like(ypos, dtype=float)
+	dz = np.nan_to_num(z.ravel(), nan=0.0)
+
+	if np.isfinite(z).any():
+		zmin = float(np.nanmin(z))
+		zmax = float(np.nanmax(z))
+		if zmax <= zmin:
+			zmax = zmin + 1.0
+		norm = plt.Normalize(vmin=zmin, vmax=zmax)
+	else:
+		norm = plt.Normalize(0, 1)
+	colors = plt.cm.jet(norm(dz))
+	ax.bar3d(xpos, ypos, zpos, dx, dy, dz, color=colors, edgecolor="k", shade=True)
+
+	ax.set_xlabel("USGS STREAMGAGING STATION NUMBER", fontsize=12)
+	ax.set_ylabel("YEAR OF ANALYSIS", fontsize=12)
+	ax.set_zlabel("WATER YIELD, IN CFSM", fontsize=12)
+	ax.set_title(
+		f"{month_name[month_idx]} Water Yields at Streamgage Locations Operated during the Period of Analysis",
+		fontsize=12,
+	)
+
+	ax.set_ylim(0, ny)
+	del_yr = 5 if (ny / 5 > 4) else 10
+	yticks = np.arange(0, ny, del_yr)
+	ax.set_yticks(yticks)
+	ax.set_yticklabels([str(wy1 + int(yv)) for yv in yticks])
+
+	xticks = np.arange(0, nt, 2)
+	ax.set_xticks(xticks)
+	ax.set_xticklabels([station_tdm[i] for i in xticks], fontsize=7, rotation=65, ha="right")
+
+	mappable = plt.cm.ScalarMappable(cmap="jet", norm=norm)
+	mappable.set_array(dz)
+	fig.colorbar(mappable, ax=ax, location="right", fraction=0.03, pad=0.08)
+	fig.tight_layout()
+	plt.show(block=False)
+
+	return {
+		"station_tdm": station_tdm,
+		"station_ths_plot": station_tdm,
+		"comid_tdm": comid_tdm,
+		"da_sq_mi_tdm": da_sq_mi_tdm,
+		"da_sq_mi_plot": da_sq_mi_tdm,
+		"q": q,
+		"y": y,
+		"target_month": target_month,
+	}

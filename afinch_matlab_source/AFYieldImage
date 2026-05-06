@@ -1,0 +1,187 @@
+"""
+AFYieldImage — Python translation of MATLAB AFYieldImage appendix.
+
+Sections:
+  1. Compute measured and adjusted incremental water yields (inches/month).
+  2. Build diverging red-white-blue colormap centred on zero.
+  3. Figure 11 — imagesc heatmap, unadjusted yields.
+  4. Figure 12 — imagesc heatmap, water-use-adjusted yields.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+
+
+# Conversion: cfs → inches/month over area in square miles
+# inches = cfs * days * 86400 s/day * 12 in/ft / (5280 ft/mi)^2
+_CFS_TO_IN_PER_SQMI = 24 * 3600 * 12 / (5280.0 ** 2)
+
+MONTH_LABELS = ["Oct", "Nov", "Dec", "Jan", "Feb", "Mar",
+                "Apr", "May", "June", "July", "Aug", "Sep"]
+
+
+def _build_diverging_cmap(clim_lo: float, clim_hi: float, n: int = 64):
+    """Return a matplotlib ListedColormap diverging red-white-blue.
+
+    Mirrors the MATLAB code: negative → red→white, positive → white→blue.
+    If *clim_lo* >= 0 the map is simply white→blue.
+    """
+    red = np.ones(n)
+    grn = np.ones(n)
+    blu = np.ones(n)
+
+    if clim_lo < 0:
+        clim_dt = (clim_hi - clim_lo) / n
+        n_step = int(abs(round(clim_lo / clim_dt)))
+        n_step = max(1, min(n_step, n - 1))
+
+        # red → white  (red stays 1, grn/blu ramp 0→1)
+        grn[:n_step] = np.interp(
+            np.linspace(clim_lo, 0, n_step), [clim_lo, 0], [0, 1]
+        )
+        blu[:n_step] = grn[:n_step].copy()
+
+        # white → blue  (blu stays 1, red/grn ramp 1→0)
+        x = np.linspace(1, clim_hi, n - n_step)
+        red[n_step:] = np.interp(x, [1, clim_hi], [1, 0])
+        grn[n_step:] = red[n_step:].copy()
+        blu[n_step:] = np.ones(n - n_step)
+    else:
+        # white → blue
+        red[:] = np.linspace(1, 0, n)
+        grn[:] = np.linspace(1, 0, n)
+        blu[:] = np.ones(n)
+
+    colors = np.column_stack([red, grn, blu])
+    return mcolors.ListedColormap(colors)
+
+
+def yield_image(
+    q_tot_inc_wy: np.ndarray,
+    q_adj_inc_wy: np.ndarray,
+    nhd_area_iwy: np.ndarray,
+    days_in_mo: np.ndarray,
+    iy: int,
+    wy: int,
+    ths: str,
+    sta_list: List[str],
+    sta_hist: List[Dict[str, Any]],
+    make_plots: bool = True,
+) -> Dict[str, Any]:
+    """Compute incremental water yields and optionally plot heatmap images.
+
+    Parameters
+    ----------
+    q_tot_inc_wy:
+        Unadjusted incremental flows, shape ``(Ns, 13)`` — 12 monthly + 1 annual column.
+    q_adj_inc_wy:
+        Water-use-adjusted incremental flows, same shape.
+    nhd_area_iwy:
+        NHD drainage area for each station (sq mi), shape ``(Ns,)``.
+    days_in_mo:
+        Days in each of the 12+1 water-year months/annual period, shape ``(13,)`` or ``(12,)``.
+    iy:
+        0-based index of the current water year.
+    wy:
+        Current water year (integer, e.g. 2000).
+    ths:
+        THS identifier string used in figure title.
+    sta_list:
+        Station ID strings in downstream order, length ``Ns``.
+    sta_hist:
+        List of per-water-year dicts; ``sta_hist[iy]`` is updated in place.
+    make_plots:
+        If ``False``, compute yields but skip figure creation.
+
+    Returns
+    -------
+    dict with keys ``y_tot_inc_wy``, ``y_adj_inc_wy``, ``sta_hist``.
+    """
+    print("AFYieldImage: Creating images of water yield.")
+
+    ns = len(nhd_area_iwy)
+    n_cols = q_tot_inc_wy.shape[1]          # 12 or 13
+
+    # Extend days_in_mo to match n_cols if needed
+    dim = np.asarray(days_in_mo, dtype=float)
+    if dim.shape[0] < n_cols:
+        dim = np.append(dim, dim.sum())      # append annual total
+
+    # -----------------------------------------------------------------
+    # 1. Convert cfs → inches/month
+    # -----------------------------------------------------------------
+    area = np.asarray(nhd_area_iwy, dtype=float)                 # (Ns,)
+    conv = dim * _CFS_TO_IN_PER_SQMI                              # (n_cols,)
+
+    y_tot = q_tot_inc_wy / area[:, np.newaxis] * conv[np.newaxis, :]  # (Ns, n_cols)
+    y_adj = q_adj_inc_wy / area[:, np.newaxis] * conv[np.newaxis, :]
+
+    # Store in StaHist
+    sta_hist[iy]["YTotIncWY"] = y_tot
+    sta_hist[iy]["YAdjIncWY"] = y_adj
+
+    if not make_plots:
+        return {"y_tot_inc_wy": y_tot, "y_adj_inc_wy": y_adj, "sta_hist": sta_hist}
+
+    # -----------------------------------------------------------------
+    # 2 & 3. Figure 11 — unadjusted yields
+    # -----------------------------------------------------------------
+    data_tot = y_tot[:, :12]
+    clim_lo = np.floor(data_tot.min() * 10) / 10
+    clim_hi = np.ceil(data_tot.max() * 10) / 10
+    cmap1 = _build_diverging_cmap(clim_lo, clim_hi)
+
+    fig11, ax11 = plt.subplots(figsize=(12, max(4, ns * 0.3)))
+    fig11.canvas.manager.set_window_title(
+        f"Apparent Incremental Monthly Water Yield in {wy} for {ths} Unadjusted for Water Use"
+    )
+    im11 = ax11.imshow(
+        data_tot, aspect="auto", cmap=cmap1,
+        vmin=clim_lo, vmax=clim_hi, origin="upper",
+    )
+    ax11.set_xticks(range(12))
+    ax11.set_xticklabels(MONTH_LABELS)
+    ax11.set_yticks(range(ns))
+    ax11.set_yticklabels(sta_list)
+    ax11.set_xlabel("MONTH, IN WATER YEAR SEQUENCE")
+    ax11.set_ylabel("USGS GAGING STATION NUMBER, IN DOWNSTREAM ORDER")
+    ax11.set_title(f"Apparent Incremental Water Yield Measured in {wy} in inches per month")
+    fig11.colorbar(im11, ax=ax11)
+    fig11.tight_layout()
+
+    # -----------------------------------------------------------------
+    # 4. Figure 12 — adjusted yields
+    # -----------------------------------------------------------------
+    data_adj = y_adj[:, :12]
+    clim_lo2 = np.floor(data_adj.min() * 10) / 10
+    clim_hi2 = np.ceil(data_adj.max() * 10) / 10
+    cmap2 = _build_diverging_cmap(clim_lo2, clim_hi2)
+
+    fig12, ax12 = plt.subplots(figsize=(12, max(4, ns * 0.3)))
+    fig12.canvas.manager.set_window_title(
+        f"Apparent Incremental Monthly Water Yield in {wy} for {ths} Adjusted for Water Use"
+    )
+    im12 = ax12.imshow(
+        data_adj, aspect="auto", cmap=cmap2,
+        vmin=clim_lo2, vmax=clim_hi2, origin="upper",
+    )
+    ax12.set_xticks(range(12))
+    ax12.set_xticklabels(MONTH_LABELS)
+    ax12.set_yticks(range(ns))
+    ax12.set_yticklabels(sta_list)
+    ax12.set_title(
+        f"Apparent Incremental Water Yield in {wy} Adjusted for Water Use, in inches per month"
+    )
+    ax12.set_xlabel("MONTH, IN WATER YEAR SEQUENCE")
+    ax12.set_ylabel("USGS GAGING STATION NUMBER, IN DOWNSTREAM ORDER")
+    fig12.colorbar(im12, ax=ax12)
+    fig12.tight_layout()
+
+    plt.show()
+
+    return {"y_tot_inc_wy": y_tot, "y_adj_inc_wy": y_adj, "sta_hist": sta_hist}

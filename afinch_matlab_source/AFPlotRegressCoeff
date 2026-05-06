@@ -1,0 +1,103 @@
+"""
+AFPlotRegressCoeff — Python translation of MATLAB AFPlotRegressCoeff.
+
+Plots year-by-year OLS and robust regression coefficients for one month,
+using the monthly models selected from the period-of-analysis regressions.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Sequence
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+def plot_regress_coeff(
+	reg_hist: Sequence[Sequence[Any]],
+	reg_month: Sequence[Any],
+	reg_var_name: Sequence[str],
+	month_name: Sequence[str],
+	im: int,
+	hsr: str,
+	wy1: int,
+	wyn: int,
+	ny: int,
+	figposition: Sequence[float] | None = None,
+) -> None:
+	"""Plot regression coefficients by year for a single month.
+
+	Parameters
+	----------
+	reg_hist:
+		Output from ``regress_by_wy`` with shape [Ny][12].
+	reg_month:
+		Monthly POA regression results from ``regress_poa``.
+	reg_var_name:
+		Names of explanatory variables.
+	month_name:
+		12 month labels.
+	im:
+		0-based month index.
+	hsr:
+		Target hydrologic subregion name.
+	wy1, wyn, ny:
+		First/last/count water-year metadata.
+	figposition:
+		Optional figure geometry surrogate. Width/height are used when present.
+	"""
+	figsize = None
+	if figposition is not None and len(figposition) >= 4:
+		figsize = (max(8.0, figposition[2] / 100.0), max(6.0, figposition[3] / 100.0))
+
+	month_result = reg_month[im]
+	ndx_par = np.flatnonzero(np.asarray(month_result.inmodel))
+
+	# MATLAB: NPar = 1 + sum(inmodel)  (intercept + active explanatory vars)
+	n_par = 1 + len(ndx_par)
+
+	beta_matrix = np.column_stack([np.asarray(reg_hist[iy][im].b, dtype=float) for iy in range(ny)])
+	beta_robust = np.column_stack([np.asarray(reg_hist[iy][im].RobustB, dtype=float) for iy in range(ny)])
+	bint_matrix = [np.asarray(reg_hist[iy][im].bint, dtype=float) for iy in range(ny)]
+
+	fig, axes = plt.subplots(n_par, 1, num=82, clear=True, figsize=figsize, squeeze=False)
+	fig.canvas.manager.set_window_title(
+		f"Period of Record Regression Coefficients for {month_name[im]} in Target Hydrologic Subregion {hsr}"
+	)
+	axes = axes[:, 0]
+
+	years_idx = np.arange(1, ny + 1)
+	year_tick_positions = np.arange(0, ny + 6, 5)
+	year_tick_labels = np.arange(wy1 - 1, wyn + 6, 5)
+
+	for ir in range(n_par):
+		ax = axes[ir]
+		ax.set_xticks(year_tick_positions)
+		ax.set_xticklabels(year_tick_labels)
+		ax.set_xlim(0, ny + 1)
+
+		ax.plot(years_idx, beta_matrix[ir, :], "bo")
+		ax.plot(years_idx, beta_robust[ir, :], "rx")
+		ax.set_ylabel("PARAMETER\nESTIMATE")
+
+		if ir == 0:
+			var_name = "Intercept"
+		else:
+			var_name = reg_var_name[ndx_par[ir - 1]]
+			ax.plot([1, ny], [0, 0], "k--")
+			poa_beta = float(month_result.b[ndx_par[ir - 1]])
+			ax.plot([1, ny], [poa_beta, poa_beta], "g-")
+			for l in range(ny):
+				if bint_matrix[l].shape[0] > ir:
+					ax.plot(
+						[l + 1, l + 1],
+						[bint_matrix[l][ir, 0], bint_matrix[l][ir, 1]],
+						color="b",
+					)
+
+		if ir == n_par - 1:
+			ax.set_xlabel("YEAR")
+		ax.set_title(var_name)
+
+	fig.tight_layout()
+	plt.show(block=False)

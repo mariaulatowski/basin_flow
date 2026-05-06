@@ -1,0 +1,89 @@
+"""
+AFQEstAdjInc — Python translation of MATLAB AFQEstAdjInc.
+
+Computes estimated adjusted incremental water yields and corresponding flows
+for each water year/month using the robust by-water-year regression models.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Sequence, Tuple
+
+import numpy as np
+
+
+_INCHES_TO_CFS = (5280.0 ** 2) / (24.0 * 3600.0 * 12.0)
+
+
+def q_est_adj_inc(
+	nlcd_ths: np.ndarray,
+	prsm_prec_ths: np.ndarray,
+	prsm_temp_ths: np.ndarray,
+	prsm_prem_ths: np.ndarray,
+	cb_matrix: np.ndarray,
+	reg_month: Sequence[Any],
+	reg_hist: Sequence[Sequence[Any]],
+	gc_area_sq_mi: np.ndarray,
+	days_in_mo: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+	"""Estimate adjusted incremental yields and flows.
+
+	Parameters
+	----------
+	nlcd_ths:
+		NLCD matrix for THS catchments, shape ``(nTHS, 21)``.
+	prsm_prec_ths:
+		Concurrent monthly precipitation, shape ``(Ny, nTHS, 12)``.
+	prsm_temp_ths:
+		Concurrent monthly temperature, shape ``(Ny, nTHS, 12)``.
+	prsm_prem_ths:
+		Lag-1 monthly precipitation, shape ``(Ny, nTHS, 12)``.
+	cb_matrix:
+		Checkbox matrix, shape ``(Nr, 24)``.
+	reg_month:
+		POA monthly regression results; each entry exposes ``inmodel``.
+	reg_hist:
+		By-water-year regression history from ``regress_by_wy``.
+	gc_area_sq_mi:
+		Incremental catchment area by THS catchment, shape ``(nTHS,)``.
+	days_in_mo:
+		Water-year month lengths, shape ``(12,)`` or larger.
+
+	Returns
+	-------
+	y_est_adj_inc, q_est_adj_inc:
+		Estimated adjusted yield and flow arrays, both shape ``(Ny, nTHS, 12)``.
+	"""
+	ny, n_ths, _ = prsm_prec_ths.shape
+	nr = cb_matrix.shape[0]
+
+	y_est_adj_inc = np.zeros((ny, n_ths, 12), dtype=float)
+	q_est_adj_inc = np.zeros((ny, n_ths, 12), dtype=float)
+
+	area_sq_mi = np.asarray(gc_area_sq_mi, dtype=float)
+	dim = np.asarray(days_in_mo, dtype=float)
+
+	for iy in range(ny):
+		for im in range(12):
+			reg_design = np.zeros((n_ths, nr), dtype=float)
+
+			for ir in range(nr):
+				reg_design[:, ir] = (
+					nlcd_ths @ cb_matrix[ir, :21].astype(float)
+					+ prsm_prec_ths[iy, :, im] * float(cb_matrix[ir, 21])
+					+ prsm_temp_ths[iy, :, im] * float(cb_matrix[ir, 22])
+					+ prsm_prem_ths[iy, :, im] * float(cb_matrix[ir, 23])
+				)
+
+			ndx_reg = np.flatnonzero(np.asarray(reg_month[im].inmodel))
+			reg_design_month = reg_design[:, ndx_reg]
+
+			robust_b = np.asarray(reg_hist[iy][im].RobustB, dtype=float)
+			design_aug = np.column_stack([np.ones(n_ths, dtype=float), reg_design_month])
+
+			y_est_adj_inc[iy, :, im] = design_aug @ robust_b
+			q_est_adj_inc[iy, :, im] = (
+				y_est_adj_inc[iy, :, im] * area_sq_mi * _INCHES_TO_CFS / dim[im]
+			)
+
+	return y_est_adj_inc, q_est_adj_inc

@@ -1,0 +1,198 @@
+"""
+Appendix 3. Initialize Common Variables in the MATLAB Workspace (AFIniAFStruct)
+
+Purpose:
+- Initialize common variables in workspace
+- Set common parameters for figures
+- Initialize structure for Target Hydrologic Subregion
+
+MATLAB Original → Python
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, Any, List
+import numpy as np
+
+
+@dataclass
+class AFinchConstants:
+    """
+    Global constants and configuration for AFINCH analysis.
+    """
+    # Month information (water year calendar Oct-Sep)
+    MONTH_NAMES: List[str] = field(default_factory=lambda: [
+        'October', 'November', 'December', 'January', 'February',
+        'March', 'April', 'May', 'June', 'July', 'August', 'September'
+    ])
+    
+    MONTH_ABBREV: List[str] = field(default_factory=lambda: [
+        'Oct.', 'Nov.', 'Dec.', 'Jan.', 'Feb.', 'Mar.', 'Apr.',
+        'May', 'June', 'July', 'Aug.', 'Sep.'
+    ])
+    
+    # Calendar month sequence in water year (Oct=1st, Sep=12th)
+    MONTH_NUMBER: List[int] = field(default_factory=lambda: [10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    
+    # Figure/plot parameters
+    FIGURE_WIDTH: int = 1100
+    FIGURE_HEIGHT: int = 700
+
+
+class AFinchWorkspace:
+    """
+    Main workspace container for AFINCH analysis.
+    Equivalent to MATLAB base workspace with named structures.
+    """
+    
+    def __init__(self, ths_number: str, ths_name: str = ''):
+        """
+        Initialize AFINCH workspace.
+        
+        Parameters
+        ----------
+        ths_number : str
+            Target Hydrologic Subregion number (e.g., '1001')
+        ths_name : str, optional
+            Target Hydrologic Subregion name
+        """
+        self.ths_number = ths_number
+        self.ths_name = ths_name
+        self.hsr_key = f"HSR_{ths_number}"  # Unique key for this HSR
+        
+        # Global constants
+        self.constants = AFinchConstants()
+        
+        # Main data structures (initialized as empty, filled by workflow steps)
+        self.structures: Dict[str, Dict[str, Any]] = {
+            self.hsr_key: {}  # Structure for target hydrologic subregion
+        }
+        
+        # Common workspace variables
+        self.variables: Dict[str, Any] = {
+            'ths_number': ths_number,
+            'ths_name': ths_name,
+            'hsr_key': self.hsr_key,
+            'month_names': self.constants.MONTH_NAMES,
+            'month_abbrev': self.constants.MONTH_ABBREV,
+            'month_number': self.constants.MONTH_NUMBER,
+        }
+    
+    def get_hsr_struct(self) -> Dict[str, Any]:
+        """Get structure for Target Hydrologic Subregion."""
+        return self.structures[self.hsr_key]
+    
+    def set_hsr_data(self, key: str, value: Any):
+        """Set data in HSR structure."""
+        self.structures[self.hsr_key][key] = value
+    
+    def get_hsr_data(self, key: str, default=None) -> Any:
+        """Get data from HSR structure."""
+        return self.structures[self.hsr_key].get(key, default)
+    
+    def set_variable(self, key: str, value: Any):
+        """Set workspace variable."""
+        self.variables[key] = value
+    
+    def get_variable(self, key: str, default=None) -> Any:
+        """Get workspace variable."""
+        return self.variables.get(key, default)
+    
+    def month_index_to_name(self, month_idx: int) -> str:
+        """
+        Convert water-year month index (0-11) to month name.
+        
+        Parameters
+        ----------
+        month_idx : int
+            Month index in water year [0=Oct, 11=Sep]
+            
+        Returns
+        -------
+        str
+            Full month name
+        """
+        return self.constants.MONTH_NAMES[month_idx % 12]
+    
+    def month_index_to_abbrev(self, month_idx: int) -> str:
+        """Convert water-year month index (0-11) to abbreviated month name."""
+        return self.constants.MONTH_ABBREV[month_idx % 12]
+    
+    def calendar_month_in_water_year(self, calendar_month: int) -> int:
+        """
+        Get position of calendar month (1-12) in water year sequence.
+        
+        Parameters
+        ----------
+        calendar_month : int
+            Calendar month [1=Jan, ..., 12=Dec]
+            
+        Returns
+        -------
+        int
+            Position in water year [1=Oct, ..., 12=Sep]
+        """
+        # MONTH_NUMBER maps water-year position to calendar month
+        # Reverse lookup
+        return self.constants.MONTH_NUMBER.index(calendar_month) + 1 if calendar_month in self.constants.MONTH_NUMBER else None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize workspace to dictionary (for pickling)."""
+        return {
+            'ths_number': self.ths_number,
+            'ths_name': self.ths_name,
+            'hsr_key': self.hsr_key,
+            'structures': self.structures,
+            'variables': self.variables,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'AFinchWorkspace':
+        """Deserialize workspace from dictionary."""
+        ws = cls(data['ths_number'], data['ths_name'])
+        ws.structures = data.get('structures', ws.structures)
+        ws.variables = data.get('variables', ws.variables)
+        return ws
+
+
+# Helper function to initialize workspace from GUI state
+def initialize_afinch_workspace(ths_number: str, ths_name: str) -> AFinchWorkspace:
+    """
+    Factory function to create initialized AFINCH workspace.
+    
+    Parameters
+    ----------
+    ths_number : str
+        Target Hydrologic Subregion number
+    ths_name : str
+        Target Hydrologic Subregion name
+        
+    Returns
+    -------
+    AFinchWorkspace
+        Initialized workspace ready for analysis
+    """
+    ws = AFinchWorkspace(ths_number, ths_name)
+    
+    # Pre-populate common structures that will be filled by workflow steps
+    hsr_data = ws.get_hsr_struct()
+    
+    # Initialize arrays/lists that workflow functions will populate:
+    # (These will be filled as analysis progresses)
+    hsr_data['precipitation'] = {}  # Monthly precipitation by year
+    hsr_data['land_cover'] = {}     # Land cover attributes
+    hsr_data['streamflow'] = {}     # Measured & estimated flows
+    hsr_data['yields'] = {}         # Water yields
+    hsr_data['regression'] = {}     # Regression results
+    
+    return ws
+
+
+if __name__ == '__main__':
+    # Example usage
+    ws = initialize_afinch_workspace('0101', 'Upper Midwest')
+    
+    print("AFINCH Workspace Initialized")
+    print(f"HSR: {ws.ths_number} - {ws.ths_name}")
+    print(f"Water Year Months: {ws.constants.MONTH_NAMES}")
+    print(f"Figure Size: {ws.constants.FIGURE_WIDTH}x{ws.constants.FIGURE_HEIGHT}")
+    print(f"HSR Data Keys: {list(ws.get_hsr_struct().keys())}")

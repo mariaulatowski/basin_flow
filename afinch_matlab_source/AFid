@@ -1,0 +1,139 @@
+"""
+AFid — Python translation of MATLAB AFid_v1d.
+
+Identifies streamgage station and activity metadata from datatip selections
+on the POA yield image plot.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Sequence
+
+import numpy as np
+
+
+@dataclass
+class AFidRecord:
+	station: str
+	active: bool
+	month_name: str
+	water_year: int
+	flow_cfs: float
+	area_sq_mi: float
+	yield_cfsm: float
+	cursor_z: float
+
+
+def _decode_cursor_index(value: float, n: int) -> int | None:
+	"""Decode datatip index from either 1-based (MATLAB-like) or 0-based coordinates.
+
+	Returns a 0-based index or None when out of bounds.
+	"""
+	r = int(round(float(value)))
+	if 1 <= r <= n:
+		return r - 1
+	if 0 <= r <= (n - 1):
+		return r
+	return None
+
+
+def af_id(
+	datatip: Iterable[Dict[str, Any]] | Iterable[Any],
+	station_ths: Sequence[str],
+	wy1: int,
+	y: np.ndarray,
+	q: np.ndarray,
+	target_month: int,
+	mo_name: Sequence[str],
+	da_sq_mi_ths: np.ndarray,
+	sta_hist: Sequence[Dict[str, Any]],
+) -> List[AFidRecord]:
+	"""Decode datatip picks into station activity details.
+
+	Parameters
+	----------
+	datatip:
+		Iterable of datatip-like items. Each item may be:
+		- dict containing key ``"Position"`` with [x, y, z], or
+		- object with attribute ``Position`` containing [x, y, z].
+	station_ths:
+		Station IDs in x-axis order.
+	wy1:
+		First water year.
+	y:
+		Yield array, shape ``(Ny, Ns, 12)``.
+	q:
+		Flow array, shape ``(Ny, Ns, 12)``.
+	target_month:
+		1-based water-year month index.
+	mo_name:
+		Month names in water-year order.
+	da_sq_mi_ths:
+		Drainage areas by station, shape ``(Ns,)``.
+	sta_hist:
+		Per-water-year station history; each entry includes ``StaList``.
+	"""
+	if target_month < 1 or target_month > 12:
+		raise ValueError("target_month must be in 1..12")
+
+	ny, ns, nmo = q.shape
+	if nmo < target_month:
+		raise ValueError("q/y arrays do not include the requested target_month")
+
+	month_idx = target_month - 1
+
+	print("-" * 64)
+	print(" Water Flow Area Yield Cursor")
+	print(" Station Active Month Year cfs mi2 cfsm pos(3)")
+	print("-" * 64)
+
+	out: List[AFidRecord] = []
+
+	for item in datatip:
+		if isinstance(item, dict):
+			pos = item.get("Position")
+		else:
+			pos = getattr(item, "Position", None)
+		if pos is None or len(pos) < 3:
+			continue
+
+		s = _decode_cursor_index(float(pos[0]), ns)
+		t = _decode_cursor_index(float(pos[1]), ny)
+		if s is None or t is None:
+			continue
+		wy = wy1 + t
+
+		station = str(station_ths[s])
+		hist_entry = sta_hist[t]
+		if isinstance(hist_entry, dict):
+			sta_vals = hist_entry.get("StaList", [])
+		else:
+			sta_vals = getattr(hist_entry, "StaList", [])
+		sta_list = [str(v) for v in sta_vals]
+		active = station in sta_list
+
+		flow_cfs = float(q[t, s, month_idx])
+		area_sq_mi = float(da_sq_mi_ths[s])
+		yield_cfsm = float(y[t, s, month_idx])
+		cursor_z = float(pos[2])
+
+		print(
+			f"{station:>12s} {('T' if active else 'F'):>1s} {mo_name[month_idx]:>9s} "
+			f"{wy:6.0f} {flow_cfs:8.2f} {area_sq_mi:8.2f} {yield_cfsm:8.4f} {cursor_z:8.4f}"
+		)
+
+		out.append(
+			AFidRecord(
+				station=station,
+				active=active,
+				month_name=str(mo_name[month_idx]),
+				water_year=wy,
+				flow_cfs=flow_cfs,
+				area_sq_mi=area_sq_mi,
+				yield_cfsm=yield_cfsm,
+				cursor_z=cursor_z,
+			)
+		)
+
+	return out

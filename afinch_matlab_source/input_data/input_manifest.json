@@ -1,0 +1,17 @@
+{
+  "required_inputs": {
+    "basin_shapefile": "afinch_matlab_source/input_data/basin/TWDB_MRBs_2014.shp",
+    "nhd_gdb_root": "afinch_matlab_source/input_data/nhd/_extracted_gdb",
+    "nlcd_raster_tif": "afinch_matlab_source/input_data/nlcd/Annual_NLCD_LndCov_2018_CU_C1V1.tif",
+    "prism_precip_dir": "afinch_matlab_source/input_data/prism/precipitation/extracted",
+    "prism_temperature_dir": "afinch_matlab_source/input_data/prism/temperature/extracted",
+    "gages_csv": "afinch_matlab_source/input_data/gages/monthly_wide_cfs.csv",
+    "wam_csv": "afinch_matlab_source/input_data/wam/Brazos_new_wam_locations_nhdplus.csv",
+    "catchment_gpkg": "afinch_matlab_source/input_data/nhd/NHDPlusCatchment_1200.gpkg"
+  },
+  "notes": [
+    "Use run/network_build/build_config.json to control reproducible builds.",
+    "Run run/network_build/run_network_build.py for dry-run or apply mode.",
+    "Run run/validation/validate_build_outputs.py after a build."
+  ]
+}

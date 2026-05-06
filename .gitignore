@@ -1,5 +1,34 @@
-texas_nhdplusgrb/
-*.zip
-*_extracted_gdb/
 __pycache__/
 *.py[cod]
+
+# Local Python environments
+.venv/
+.conda/
+
+# Notebook and local cache artifacts
+.ipynb_checkpoints/
+
+# Large geospatial/raw data (download separately)
+inputData/
+inputData/texas_nhdplusgrb/
+inputData/texas_nhdplusgrb/_extracted_gdb/
+inputData/Annual_NLCD_LndCov_2018_CU_C1V1.tif
+inputData/Annual_NLCD_LndCov_2018_CU_C1V1.tif.aux.xml
+
+afinch_matlab_source/input_data/nhd/_extracted_gdb/
+afinch_matlab_source/input_data/nhd/NHDPlusCatchment_*.gpkg
+afinch_matlab_source/input_data/nlcd/*
+!afinch_matlab_source/input_data/nlcd/.gitkeep
+afinch_matlab_source/input_data/prism/precipitation/extracted/*
+afinch_matlab_source/input_data/prism/temperature/extracted/*
+
+# Compressed source archives
+*.zip
+
+# Generated model outputs and run directories
+output/
+HSR*/
+afinch_runtime_repo/
+
+# Local serialized run snapshots
+*.pkl

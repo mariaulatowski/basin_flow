@@ -1,0 +1,60 @@
+"""Read and intersect NLCD catchment attributes with THS flowlines."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+
+NLCD_COLS = [
+    "NLCD11", "NLCD12", "NLCD21", "NLCD22", "NLCD23", "NLCD31", "NLCD32", "NLCD33",
+    "NLCD41", "NLCD42", "NLCD43", "NLCD51", "NLCD61", "NLCD71", "NLCD81", "NLCD82",
+    "NLCD83", "NLCD84", "NLCD85", "NLCD91", "NLCD92",
+]
+
+
+@dataclass
+class NLCDResult:
+    comid_ths: np.ndarray
+    gridcode_ths: np.ndarray
+    nlcd_ths: np.ndarray
+    flowline_ths: pd.DataFrame
+
+
+def read_nlcd(base_dir: Path | str, ths: str) -> NLCDResult:
+    base_dir = Path(base_dir)
+    hsr = f"HSR{ths[:2]}00"
+
+    nlcd_path = base_dir / hsr / "NLCD" / "catchmentattributesnlcd.txt"
+    nhd_path = base_dir / hsr / "Flowlines" / "nhdflowline.txt"
+
+    if not nlcd_path.exists():
+        raise FileNotFoundError(f"Missing NLCD file: {nlcd_path}")
+    if not nhd_path.exists():
+        raise FileNotFoundError(f"Missing flowline file: {nhd_path}")
+
+    nlcd_cols = ["ComID", "GridCode", *NLCD_COLS, "PCTCN", "PCTMX", "SUMPCT"]
+    nlcd = pd.read_csv(nlcd_path, sep=",", header=0)
+    nlcd.columns = nlcd_cols[: len(nlcd.columns)]
+
+    flow = pd.read_csv(nhd_path, sep=",", header=0)
+    if "ComID" not in flow.columns:
+        flow.columns = ["ComID", "LengthKm", "ReachCode", *[f"c{i}" for i in range(len(flow.columns) - 3)]]
+
+    # The nhdflowline.txt inside HSR{ths}00/Flowlines is already THS-specific,
+    # so no ReachCode prefix filter is applied — use all rows.
+    flow_ths = flow.copy()
+    merged = flow_ths[["ComID"]].merge(nlcd[["ComID", "GridCode", *NLCD_COLS]], on="ComID", how="inner")
+
+    comid_ths = merged["ComID"].to_numpy(dtype=np.int64)
+    gridcode_ths = merged["GridCode"].to_numpy(dtype=np.int64)
+    nlcd_ths = merged[NLCD_COLS].to_numpy(dtype=float)
+
+    return NLCDResult(
+        comid_ths=comid_ths,
+        gridcode_ths=gridcode_ths,
+        nlcd_ths=nlcd_ths,
+        flowline_ths=flow_ths,
+    )

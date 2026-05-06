@@ -1,0 +1,842 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import rasterio
+
+try:
+    from build_brazos_hu4_1205_network import (
+        SQKM_TO_SQMI,
+        _backup,
+        _load_station_points,
+        _read_streamflow_dat,
+        _write_streamflow_dat,
+    )
+except ModuleNotFoundError:
+    from afinch_python_modules.build_brazos_hu4_1205_network import (
+        SQKM_TO_SQMI,
+        _backup,
+        _load_station_points,
+        _read_streamflow_dat,
+        _write_streamflow_dat,
+    )
+
+
+NLCD_CLASSES = [11, 12, 21, 22, 23, 31, 32, 33, 41, 42, 43, 51, 61, 71, 81, 82, 83, 84, 85, 91, 92]
+
+
+def _norm_station_id(v: object) -> str:
+    s = str(v).strip()
+    if s.endswith('.0'):
+        s = s[:-2]
+    return s.lstrip('0') or '0'
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build a basin-wide runnable Brazos AFINCH package from all intersecting medium-resolution HU4 NHD datasets."
+    )
+    parser.add_argument("--base-dir", default=".", help="Workspace base directory")
+    parser.add_argument("--ths", default="1200", help="Synthetic basin-wide THS code used by the converted runtime")
+    parser.add_argument("--hsr", default="HSR1200", help="HSR folder name used by converted runtime")
+    parser.add_argument(
+        "--basin-shp",
+        default="inputData/river_basin/TWDB_MRBs_2014.shp",
+        help="Basin polygon shapefile used to clip the network",
+    )
+    parser.add_argument("--basin-field", default="basin_name", help="Basin name field in the basin shapefile")
+    parser.add_argument("--basin-value", default="Brazos", help="Basin name value to extract")
+    parser.add_argument(
+        "--gdb-root",
+        default="inputData/nhd_medium_res_gdb",
+        help="Directory containing NHD_H_XXXX_HU4_GDB folders",
+    )
+    parser.add_argument(
+        "--hu4s",
+        default="",
+        help="Optional comma-separated HU4 codes to force instead of auto-discovery",
+    )
+    parser.add_argument("--wy", type=int, default=2018, help="Water year to generate PRISM files for")
+    parser.add_argument(
+        "--nlcd-raster",
+        default="inputData/Annual_NLCD_LndCov_2018_CU_C1V1.tif",
+        help="NLCD raster used to derive catchment NLCD attributes",
+    )
+    parser.add_argument(
+        "--prism-ppt-dir",
+        default="inputData/prism_monthly/ppt/extracted",
+        help="Directory with monthly PRISM precipitation rasters",
+    )
+    parser.add_argument(
+        "--prism-tmean-dir",
+        default="inputData/prism_monthly/tmean/extracted",
+        help="Directory with monthly PRISM tmean rasters",
+    )
+    parser.add_argument(
+        "--gages-csv",
+        default="",
+        help=(
+            "CSV of USGS gage stations to snap to reaches. "
+            "Required columns: Station (or Gage_ID_norm), LAT, LONG. "
+            "If omitted, falls back to inputData/inputs/monthly_wide_acft.csv (Brazos default)."
+        ),
+    )
+    parser.add_argument(
+        "--gages-flow-units",
+        choices=["auto", "cfs", "acft"],
+        default="auto",
+        help=(
+            "Units of monthly flow values in --gages-csv when building ComIDStationDAMoAnQYYYY.dat. "
+            "Use auto (default), cfs, or acft."
+        ),
+    )
+    parser.add_argument(
+        "--wam-csv",
+        default="",
+        help=(
+            "Optional CSV of WAM control-point stations. "
+            "Required columns: Station (or CPID), LAT, LONG. "
+            "If omitted, falls back to HSR1200/Streamflow/Brazos_new_wam_locations_nhdplus.csv "
+            "(Brazos default), or skipped silently if that file doesn't exist."
+        ),
+    )
+    parser.add_argument("--apply", action="store_true", help="Apply updates into HSR files (writes backups)")
+    return parser.parse_args()
+
+
+def _wy_months(wy: int) -> list[tuple[int, int]]:
+    return [
+        (wy - 1, 10),
+        (wy - 1, 11),
+        (wy - 1, 12),
+        (wy, 1),
+        (wy, 2),
+        (wy, 3),
+        (wy, 4),
+        (wy, 5),
+        (wy, 6),
+        (wy, 7),
+        (wy, 8),
+        (wy, 9),
+    ]
+
+
+def _resolve_prism_raster(base_dir: Path, prism_dir: str, kind: str, year: int, month: int) -> Path:
+    root = (base_dir / prism_dir).resolve()
+    if not root.exists():
+        raise FileNotFoundError(root)
+
+    pattern = f"prism_{kind}_us_25m_{year}{month:02d}.tif"
+    exact = root / pattern
+    if exact.exists():
+        return exact
+
+    matches = sorted(root.glob(f"*{year}{month:02d}*.tif"))
+    if not matches:
+        raise FileNotFoundError(f"No PRISM raster matched {kind} {year}-{month:02d} in {root}")
+    return matches[0]
+
+
+def _sample_raster(points_4269: gpd.GeoDataFrame, raster_path: Path) -> np.ndarray:
+    with rasterio.open(raster_path) as src:
+        pts = points_4269.to_crs(src.crs)
+        coords = [(geom.x, geom.y) for geom in pts.geometry]
+        vals = np.array([row[0] for row in src.sample(coords)], dtype=float)
+        nodata = src.nodata
+        if nodata is not None:
+            vals[np.isclose(vals, nodata)] = np.nan
+        vals[~np.isfinite(vals)] = np.nan
+        return vals
+
+
+def _days_in_month(year: int, month: int) -> int:
+    if month in (1, 3, 5, 7, 8, 10, 12):
+        return 31
+    if month in (4, 6, 9, 11):
+        return 30
+    leap = (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+    return 29 if leap else 28
+
+
+def _monthly_acft_to_cfs(acft: float, year: int, month: int) -> float:
+    secs = float(_days_in_month(year, month) * 24 * 3600)
+    return float(acft) * 43560.0 / secs
+
+
+def _build_streamflow_dat_from_gages_csv(
+    base_dir: Path,
+    wy: int,
+    station_map: pd.DataFrame,
+    gages_csv: str,
+    units: str,
+    out_dat_path: Path,
+    out_da_path: Path,
+) -> pd.DataFrame:
+    gages_path = Path(gages_csv)
+    if not gages_path.is_absolute():
+        gages_path = base_dir / gages_csv
+    if not gages_path.exists():
+        return pd.DataFrame()
+
+    src = pd.read_csv(gages_path)
+
+    id_col = next((c for c in src.columns if c in ("Gage_ID_norm", "Station", "station", "STATION", "CPID", "cpid")), None)
+    if id_col is None:
+        return pd.DataFrame()
+
+    year_col = next((c for c in src.columns if str(c).lower() in ("year", "wy", "water_year")), None)
+    if year_col is None:
+        return pd.DataFrame()
+
+    month_cols = {m: next((c for c in src.columns if str(c).upper() == m), None) for m in ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]}
+    if any(v is None for v in month_cols.values()):
+        return pd.DataFrame()
+
+    local_units = units
+    if local_units == "auto":
+        name = gages_path.name.lower()
+        if "cfs" in name:
+            local_units = "cfs"
+        elif "acft" in name or "acre" in name:
+            local_units = "acft"
+        else:
+            local_units = "cfs"
+
+    src = src.copy()
+    src["StationN"] = src[id_col].map(_norm_station_id)
+    src[year_col] = pd.to_numeric(src[year_col], errors="coerce")
+    src = src[src[year_col] == float(wy)].copy()
+    if src.empty:
+        return pd.DataFrame()
+    src = src.drop_duplicates(subset=["StationN"], keep="first")
+
+    sm = station_map.copy()
+    sm["StationN"] = sm["Station"].map(_norm_station_id)
+    sm = sm.drop_duplicates(subset=["StationN"], keep="first")
+
+    work = sm.merge(src[["StationN", *month_cols.values()]], on="StationN", how="inner")
+    if work.empty:
+        return pd.DataFrame()
+
+    q_wy_order = ["OCT", "NOV", "DEC", "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP"]
+    rows = []
+    for _, r in work.iterrows():
+        vals = []
+        for m in q_wy_order:
+            v = pd.to_numeric(r[month_cols[m]], errors="coerce")
+            v = 0.0 if pd.isna(v) else float(v)
+            if local_units == "acft":
+                cal_month = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"].index(m) + 1
+                v = _monthly_acft_to_cfs(v, wy, cal_month)
+            vals.append(v)
+
+        q13 = float(np.mean(vals))
+        rows.append([
+            int(pd.to_numeric(r["ComID"], errors="coerce")),
+            str(r["StationN"]),
+            5.79,
+            *vals,
+            q13,
+        ])
+
+    if not rows:
+        return pd.DataFrame()
+
+    cols = ["ComIDSta", "StaWY", "NWISArea", *[f"Q{i:02d}" for i in range(1, 14)]]
+    dat = pd.DataFrame(rows, columns=cols)
+    dat["ComIDSta"] = pd.to_numeric(dat["ComIDSta"], errors="coerce").fillna(0).astype(np.int64)
+    dat["StaWY"] = dat["StaWY"].map(_norm_station_id)
+    _write_streamflow_dat(dat, out_dat_path)
+
+    da = dat[["StaWY", "ComIDSta", "NWISArea"]].drop_duplicates(subset=["StaWY"], keep="first").copy()
+    da = da.rename(columns={"StaWY": "Station", "ComIDSta": "ComID", "NWISArea": "DASqMi"})
+    da.to_csv(out_da_path, index=False)
+    return dat
+
+
+def _build_real_nlcd(flow_geom: gpd.GeoDataFrame, nlcd_raster: Path) -> pd.DataFrame:
+    points = flow_geom[["ComID", "geometry"]].copy()
+    points["geometry"] = points.geometry.representative_point()
+    points = gpd.GeoDataFrame(points, geometry="geometry", crs=flow_geom.crs)
+
+    cls = pd.Series(_sample_raster(points, nlcd_raster)).round().astype("Int64")
+    out = pd.DataFrame({"ComID": points["ComID"].to_numpy(dtype=np.int64), "GridCode": points["ComID"].to_numpy(dtype=np.int64)})
+    for code in NLCD_CLASSES:
+        col = f"NLCD{code}"
+        out[col] = np.where(cls.to_numpy(dtype="float64", na_value=np.nan) == float(code), 100.0, 0.0)
+
+    out["PCTCN"] = 0.0
+    out["PCTMX"] = 0.0
+    nlcd_cols = [f"NLCD{c}" for c in NLCD_CLASSES]
+    out["SUMPCT"] = out[nlcd_cols].sum(axis=1)
+    return out
+
+
+def _build_real_prism(base_dir: Path, flow_geom: gpd.GeoDataFrame, wy: int, prism_ppt_dir: str, prism_tmean_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    points = flow_geom[["ComID", "geometry"]].copy()
+    points["geometry"] = points.geometry.representative_point()
+    points = gpd.GeoDataFrame(points, geometry="geometry", crs=flow_geom.crs)
+
+    ppt_vals: list[np.ndarray] = []
+    tmean_vals: list[np.ndarray] = []
+    for year, month in _wy_months(wy):
+        ppt_path = _resolve_prism_raster(base_dir, prism_ppt_dir, "ppt", year, month)
+        tmean_path = _resolve_prism_raster(base_dir, prism_tmean_dir, "tmean", year, month)
+        ppt_vals.append(_sample_raster(points, ppt_path))
+        tmean_vals.append(_sample_raster(points, tmean_path))
+
+    ppt_stack = np.column_stack(ppt_vals)
+    tmean_stack = np.column_stack(tmean_vals)
+
+    # Fill sparse nodata with month medians to keep converted runtime stable.
+    for col in range(ppt_stack.shape[1]):
+        month = ppt_stack[:, col]
+        med = np.nanmedian(month)
+        if not np.isfinite(med):
+            med = 0.0
+        month[np.isnan(month)] = med
+        ppt_stack[:, col] = month
+
+    for col in range(tmean_stack.shape[1]):
+        month = tmean_stack[:, col]
+        med = np.nanmedian(month)
+        if not np.isfinite(med):
+            med = 0.0
+        month[np.isnan(month)] = med
+        tmean_stack[:, col] = month
+
+    precip = pd.DataFrame({"GridCode": points["ComID"].to_numpy(dtype=np.int64), "GCAreaSqMi": np.full(len(points), 1.0, dtype=float)})
+    for month in range(12):
+        precip[f"PIn_{month + 1:02d}"] = ppt_stack[:, month]
+    precip["PIn_13"] = ppt_stack.mean(axis=1)
+
+    temp = pd.DataFrame({"GridCode": points["ComID"].to_numpy(dtype=np.int64)})
+    for month in range(12):
+        temp[f"TdC_{month + 1:02d}"] = tmean_stack[:, month]
+
+    return precip, temp
+
+
+def _load_basin_polygon(base_dir: Path, basin_shp: str, basin_field: str, basin_value: str) -> gpd.GeoDataFrame:
+    basin_path = (base_dir / basin_shp).resolve()
+    if not basin_path.exists():
+        raise FileNotFoundError(basin_path)
+
+    basin = gpd.read_file(basin_path)
+    if basin_field not in basin.columns:
+        raise KeyError(f"Missing basin field '{basin_field}' in {basin_path}")
+
+    basin = basin[basin[basin_field].astype(str).str.contains(basin_value, case=False, na=False)].copy()
+    if basin.empty:
+        raise ValueError(f"No basin polygons matched {basin_field}={basin_value!r}")
+    if basin.crs is None:
+        basin = basin.set_crs("EPSG:4269")
+    return basin
+
+
+def _discover_hu4_gdbs(base_dir: Path, gdb_root: str, basin_gdf: gpd.GeoDataFrame, forced_hu4s: str) -> list[tuple[str, Path]]:
+    root = (base_dir / gdb_root).resolve()
+    if not root.exists():
+        raise FileNotFoundError(root)
+
+    forced = {item.strip() for item in forced_hu4s.split(",") if item.strip()}
+    basin_proj = basin_gdf.to_crs(5070)
+    basin_union = basin_proj.geometry.union_all()
+
+    hits: list[tuple[str, Path]] = []
+
+    # Support both naming conventions found in this workspace:
+    # 1) NHD_H_1205_HU4_GDB/<name>.gdb
+    # 2) NHDPLUS_H_1205_HU4_GDB/<name>.gdb
+    gdb_candidates = sorted(root.glob("NHD_H_*_HU4_GDB/*.gdb")) + sorted(root.glob("NHDPLUS_H_*_HU4_GDB/*.gdb"))
+
+    for gdb in gdb_candidates:
+        parts = gdb.parent.name.split("_")
+        if len(parts) < 4:
+            continue
+        hu4 = parts[2]
+        if forced and hu4 not in forced:
+            continue
+
+        wbd = gpd.read_file(gdb, layer="WBDHU4")
+        if wbd.empty:
+            continue
+        if wbd.crs is None:
+            wbd = wbd.set_crs(basin_gdf.crs or "EPSG:4269")
+        inter_area = wbd.to_crs(5070).geometry.union_all().intersection(basin_union).area
+        if inter_area > 0:
+            hits.append((hu4, gdb))
+
+    if not hits:
+        raise ValueError("No HU4 geodatabases intersect the selected basin polygon")
+    return hits
+
+
+def _load_basin_flowline_and_vaa(gdbs: list[tuple[str, Path]], basin_gdf: gpd.GeoDataFrame, ths: str) -> tuple[pd.DataFrame, pd.DataFrame, gpd.GeoDataFrame]:
+    import warnings
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    basin_latlon = basin_gdf.to_crs(4269)
+    bbox = tuple(float(v) for v in basin_latlon.total_bounds)
+
+    def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+        lower_map = {str(c).lower(): c for c in df.columns}
+        for name in candidates:
+            found = lower_map.get(name.lower())
+            if found is not None:
+                return found
+        return None
+
+    def _load_one_gdb(hu4_gdb: tuple[str, Path]):
+        """Load flowline + VAA from a single GDB; return (flow_part, vaa_part) or (None, None)."""
+        hu4, gdb = hu4_gdb
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fl = gpd.read_file(
+                gdb,
+                layer="NHDFlowline",
+                bbox=bbox,
+                columns=["permanent_identifier", "COMID", "NHDPlusID", "lengthkm", "LengthKM", "reachcode", "ReachCode", "geometry"],
+            )
+        if fl.empty:
+            return None, None
+        if fl.crs is None:
+            fl = fl.set_crs(basin_latlon.crs)
+        fl = gpd.clip(fl.to_crs(basin_latlon.crs), basin_latlon)
+        if fl.empty:
+            return None, None
+
+        comid_col = _pick_col(fl, ["comid", "nhdplusid", "permanent_identifier", "permanent_id", "permanentidentifier"])
+        if comid_col is None:
+            raise KeyError(f"No ComID-like field found in NHDFlowline for {gdb}. Columns: {list(fl.columns)}")
+        fl["ComID"] = pd.to_numeric(fl[comid_col], errors="coerce")
+
+        len_col = _pick_col(fl, ["lengthkm", "length_km", "shape_length"])
+        fl["LengthKm"] = pd.to_numeric(fl[len_col], errors="coerce") if len_col else 1.0
+
+        reach_col = _pick_col(fl, ["reachcode", "reach_code", "reachcode_1"])
+        fl = fl.dropna(subset=["ComID", "geometry"]).copy()
+        fl = fl[~fl.geometry.is_empty].copy()
+        fl["ComID"] = fl["ComID"].astype("int64")
+        fl["LengthKm"] = fl["LengthKm"].fillna(1.0).clip(lower=0.01)
+        fl["OrigReachCode"] = fl[reach_col].astype(str).str.strip() if reach_col else ""
+        fl["ReachCode"] = ""  # will be reassigned after concat
+        flow_part = fl[["ComID", "LengthKm", "ReachCode", "OrigReachCode", "geometry"]].copy()
+
+        vaa = None
+        vaa_layer_names = ["NHDFlowlineVAA", "NHDPlusFlowlineVAA"]
+        vaa_last_exc: Exception | None = None
+        for vaa_layer in vaa_layer_names:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    vaa = gpd.read_file(
+                        gdb,
+                        layer=vaa_layer,
+                        columns=[
+                            "permanent_identifier", "COMID", "NHDPlusID",
+                            "hydroseq", "dnhydroseq", "fromnode", "tonode",
+                            "divergenceflag", "startflag",
+                        ],
+                    )
+                break
+            except Exception as exc:
+                vaa_last_exc = exc
+                continue
+        if vaa is None:
+            raise RuntimeError(f"Could not open VAA layer in {gdb}. Tried: {vaa_layer_names}. Last error: {vaa_last_exc}")
+
+        vaa_comid_col = _pick_col(vaa, ["comid", "nhdplusid", "permanent_identifier", "permanent_id", "permanentidentifier"])
+        if vaa_comid_col is None:
+            raise KeyError(f"No ComID-like field found in NHDFlowlineVAA for {gdb}. Columns: {list(vaa.columns)}")
+        hydro_col = _pick_col(vaa, ["hydroseq"])
+        dn_hydro_col = _pick_col(vaa, ["dnhydroseq", "dn_hydroseq"])
+        from_col = _pick_col(vaa, ["fromnode"])
+        to_col = _pick_col(vaa, ["tonode"])
+        div_col = _pick_col(vaa, ["divergenceflag", "divergence"])
+        start_col = _pick_col(vaa, ["startflag", "start_flag"])
+
+        vaa["ComID"] = pd.to_numeric(vaa[vaa_comid_col], errors="coerce")
+        vaa["HydroSeq"] = pd.to_numeric(vaa[hydro_col], errors="coerce") if hydro_col else np.nan
+        vaa["DnHydroSeq"] = pd.to_numeric(vaa[dn_hydro_col], errors="coerce") if dn_hydro_col else np.nan
+        vaa["FromNode"] = pd.to_numeric(vaa[from_col], errors="coerce") if from_col else np.nan
+        vaa["ToNode"] = pd.to_numeric(vaa[to_col], errors="coerce") if to_col else np.nan
+        vaa["Divergence"] = pd.to_numeric(vaa[div_col], errors="coerce").fillna(0) if div_col else 0
+        vaa["StartFlag"] = pd.to_numeric(vaa[start_col], errors="coerce").fillna(0) if start_col else 0
+        vaa_part = vaa[["ComID", "FromNode", "ToNode", "HydroSeq", "DnHydroSeq", "Divergence", "StartFlag"]].copy()
+        return flow_part, vaa_part
+
+    # --- parallel load ---
+    flow_parts: list[gpd.GeoDataFrame] = []
+    vaa_parts: list[pd.DataFrame] = []
+    n_workers = min(len(gdbs), 6)  # cap at 6 to avoid memory pressure
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_load_one_gdb, item): item[0] for item in gdbs}
+        for fut in as_completed(futures):
+            hu4 = futures[fut]
+            fp, vp = fut.result()  # raises immediately on error
+            print(f"  Loaded GDB {hu4}")
+            if fp is not None:
+                flow_parts.append(fp)
+            if vp is not None:
+                vaa_parts.append(vp)
+
+    # Legacy sequential loop removed — replaced by parallel block above.
+    if not flow_parts:
+        raise ValueError("No clipped flowlines were found for the selected basin")
+
+    flow = pd.concat(flow_parts, ignore_index=True)
+    flow = flow.sort_values(["ComID", "LengthKm"], ascending=[True, False]).drop_duplicates(subset=["ComID"], keep="first")
+    flow = flow.reset_index(drop=True)
+    flow["ReachCode"] = [f"{ths}{i:010d}" for i in range(1, len(flow) + 1)]
+
+    flow_geom = gpd.GeoDataFrame(flow[["ComID", "ReachCode", "OrigReachCode", "geometry"]].copy(), geometry="geometry", crs=basin_latlon.crs)
+    flow_tbl = flow[["ComID", "LengthKm", "ReachCode"]].copy()
+
+    if vaa_parts:
+        vaa = pd.concat(vaa_parts, ignore_index=True)
+        vaa = vaa.dropna(subset=["ComID"]).copy()
+        vaa["ComID"] = vaa["ComID"].astype("int64")
+        vaa = vaa[vaa["ComID"].isin(flow_tbl["ComID"])].copy()
+    else:
+        vaa = pd.DataFrame(columns=["ComID", "FromNode", "ToNode", "HydroSeq", "Divergence", "StartFlag"])
+
+    if vaa.empty:
+        synthetic = flow_tbl[["ComID"]].copy()
+        synthetic["HydroSeq"] = np.arange(len(synthetic), 0, -1, dtype=np.int64)
+        synthetic["FromNode"] = synthetic["HydroSeq"]
+        synthetic["ToNode"] = np.append(synthetic["HydroSeq"].to_numpy(dtype=np.int64)[1:], 0)
+        synthetic["Divergence"] = 0
+        synthetic["StartFlag"] = 0
+        synthetic.loc[synthetic.index[0], "StartFlag"] = 1
+        vaa_out = synthetic[["ComID", "FromNode", "ToNode", "HydroSeq", "Divergence", "StartFlag"]]
+    else:
+        vaa = vaa[["ComID", "FromNode", "ToNode", "HydroSeq", "DnHydroSeq", "Divergence", "StartFlag"]].copy()
+        vaa["HydroSeq"] = pd.to_numeric(vaa["HydroSeq"], errors="coerce").fillna(0)
+        missing_hs = vaa["HydroSeq"] <= 0
+        if missing_hs.any():
+            fill_vals = np.arange(missing_hs.sum(), 0, -1, dtype=np.int64)
+            vaa.loc[missing_hs, "HydroSeq"] = fill_vals
+        vaa["HydroSeq"] = vaa["HydroSeq"].astype("int64")
+        vaa["FromNode"] = pd.to_numeric(vaa["FromNode"], errors="coerce")
+        vaa["ToNode"] = pd.to_numeric(vaa["ToNode"], errors="coerce")
+        vaa["DnHydroSeq"] = pd.to_numeric(vaa["DnHydroSeq"], errors="coerce").fillna(0)
+
+        # Some source VAA tables provide HydroSeq/DnHydroSeq but leave node ids empty.
+        # In that case, derive node connectivity directly from hydro-sequence linkage.
+        to_nonzero = int((vaa["ToNode"].fillna(0) != 0).sum())
+        dn_nonzero = int((vaa["DnHydroSeq"] != 0).sum())
+        if to_nonzero == 0 and dn_nonzero > 0:
+            print("WARNING: VAA ToNode values are empty; deriving connectivity from HydroSeq/DnHydroSeq.")
+            # Use DnHydroSeq directly as ToNode — interior reaches will chain correctly.
+            # Outlet reaches naturally have DnHydroSeq=0 (which becomes ToNode=0).
+            # Do NOT filter by valid_hs: after basin clipping, downstream boundary reaches
+            # won't be in the set, which would zero out all interior ToNode values.
+            vaa["FromNode"] = vaa["HydroSeq"].astype("int64")
+            vaa["ToNode"] = vaa["DnHydroSeq"].astype("int64")
+
+        vaa["FromNode"] = vaa["FromNode"].fillna(vaa["HydroSeq"]).astype("int64")
+        vaa["ToNode"] = vaa["ToNode"].fillna(0).astype("int64")
+        vaa["Divergence"] = pd.to_numeric(vaa["Divergence"], errors="coerce").fillna(0).astype("int64")
+        vaa["StartFlag"] = pd.to_numeric(vaa["StartFlag"], errors="coerce").fillna(0).astype("int64")
+
+        # Recompute StartFlag for consistency with final node topology.
+        upstream_targets = set(vaa["ToNode"].tolist())
+        vaa["StartFlag"] = (~vaa["FromNode"].isin(upstream_targets)).astype("int64")
+
+        missing = np.setdiff1d(flow_tbl["ComID"].to_numpy(dtype=np.int64), vaa["ComID"].to_numpy(dtype=np.int64))
+        if len(missing) > 0:
+            extra = pd.DataFrame({"ComID": missing})
+            extra["HydroSeq"] = np.arange(len(vaa) + len(extra), len(vaa), -1, dtype=np.int64)
+            extra["FromNode"] = extra["HydroSeq"]
+            extra["ToNode"] = 0
+            extra["Divergence"] = 0
+            extra["StartFlag"] = 1
+            vaa = pd.concat([vaa, extra], ignore_index=True)
+        vaa_out = vaa.sort_values("ComID").drop_duplicates(subset=["ComID"], keep="first").reset_index(drop=True)
+
+    nonzero_to = int((vaa_out["ToNode"] != 0).sum())
+    if nonzero_to == 0:
+        raise RuntimeError(
+            "Built VAA has no downstream links (ToNode all zero). "
+            "Upstream gaged-catchment tracing will collapse to 1 reach per station. "
+            "Check VAA source fields (FromNode/ToNode or HydroSeq/DnHydroSeq) before applying build outputs."
+        )
+
+    return flow_tbl, vaa_out, flow_geom[["ComID", "ReachCode", "OrigReachCode", "geometry"]].copy()
+
+
+def _map_stations_to_comid(flow_geom: gpd.GeoDataFrame, station_points: pd.DataFrame) -> pd.DataFrame:
+    pts = gpd.GeoDataFrame(station_points.copy(), geometry=gpd.points_from_xy(station_points["LONG"], station_points["LAT"]), crs="EPSG:4326")
+
+    flow_gdf = flow_geom.copy()
+    if flow_gdf.crs is None:
+        flow_gdf = flow_gdf.set_crs("EPSG:4269")
+
+    proj = flow_gdf.estimate_utm_crs()
+    flow_proj = flow_gdf.to_crs(proj)
+    pts_proj = pts.to_crs(proj)
+    nearest = gpd.sjoin_nearest(
+        pts_proj[["Station", "Source", "LAT", "LONG", "geometry"]],
+        flow_proj[["ComID", "geometry"]],
+        how="left",
+        distance_col="snap_dist_m",
+    )
+    nearest = nearest.drop(columns=[c for c in ["index_right"] if c in nearest.columns])
+    nearest = nearest.dropna(subset=["ComID"]).copy()
+    nearest["ComID"] = pd.to_numeric(nearest["ComID"], errors="coerce").astype("int64")
+    nearest = nearest.sort_values(["Station", "snap_dist_m"]).drop_duplicates(subset=["Station"], keep="first")
+    return pd.DataFrame(nearest[["Station", "ComID", "Source", "snap_dist_m"]]).sort_values("Station")
+
+
+def _normalize_station_id_local(s: str) -> str:
+    """Normalize station IDs (strip leading zeros, upper-case)."""
+    s = str(s).strip().upper()
+    # Strip leading zeros from purely numeric ids
+    if s.isdigit():
+        s = str(int(s))
+    return s
+
+
+def _load_station_points_flexible(
+    base_dir: Path,
+    gages_csv: str = "",
+    wam_csv: str = "",
+) -> pd.DataFrame:
+    """
+    Load gage station lat/long for reach-snapping.
+
+    If ``gages_csv`` is provided it is used as the USGS/primary gage source.
+    Accepted column names: Station or Gage_ID_norm (id), LAT, LONG.
+
+    If ``wam_csv`` is provided it is used as the WAM control-point source.
+    Accepted column names: Station or CPID (id), LAT, LONG.
+
+    If either path is omitted the function falls back to the Brazos-specific
+    default files so the existing Brazos workflow is unchanged.
+    """
+    parts: list[pd.DataFrame] = []
+
+    # ── Primary (USGS) gage source ─────────────────────────────────────────
+    if gages_csv:
+        primary_path = Path(gages_csv)
+        if not primary_path.is_absolute():
+            primary_path = base_dir / gages_csv
+    else:
+        primary_path = base_dir / "inputData" / "inputs" / "monthly_wide_acft.csv"
+
+    if primary_path.exists():
+        df = pd.read_csv(primary_path, dtype=str)
+        # Flexible column detection for station id
+        id_col = next(
+            (c for c in df.columns if c in ("Station", "Gage_ID_norm", "STATION", "station")),
+            df.columns[0],
+        )
+        lat_col  = next((c for c in df.columns if c.upper() == "LAT"),  None)
+        long_col = next((c for c in df.columns if c.upper() in ("LONG", "LON", "LONGITUDE")), None)
+        if lat_col and long_col:
+            src = pd.DataFrame({
+                "Station": df[id_col].astype(str).apply(_normalize_station_id_local),
+                "LAT":  pd.to_numeric(df[lat_col],  errors="coerce"),
+                "LONG": pd.to_numeric(df[long_col], errors="coerce"),
+                "Source": "USGS",
+            }).dropna(subset=["LAT", "LONG"]).drop_duplicates(subset=["Station"], keep="first")
+            parts.append(src)
+            print(f"Primary gages loaded: {len(src):,} stations from {primary_path.name}")
+        else:
+            print(f"WARNING: Could not find LAT/LONG columns in {primary_path}. Available: {list(df.columns)}")
+    else:
+        print(f"WARNING: Primary gages CSV not found: {primary_path}. No USGS stations will be loaded.")
+
+    # ── Secondary (WAM) control-point source ───────────────────────────────
+    # wam_csv=="NONE" means explicitly skip WAM (USGS-only mode)
+    if wam_csv != "NONE":
+        if wam_csv:
+            secondary_path = Path(wam_csv)
+            if not secondary_path.is_absolute():
+                secondary_path = base_dir / wam_csv
+        else:
+            secondary_path = base_dir / "HSR1200" / "Streamflow" / "Brazos_new_wam_locations_nhdplus.csv"
+
+        if secondary_path.exists():
+            df2 = pd.read_csv(secondary_path, dtype=str)
+            id_col2 = next(
+                (c for c in df2.columns if c in ("Station", "CPID", "STATION", "station", "cpid")),
+                df2.columns[0],
+            )
+            lat_col2  = next((c for c in df2.columns if c.upper() == "LAT"),  None)
+            long_col2 = next((c for c in df2.columns if c.upper() in ("LONG", "LON", "LONGITUDE")), None)
+            if lat_col2 and long_col2:
+                src2 = pd.DataFrame({
+                    "Station": df2[id_col2].astype(str).apply(_normalize_station_id_local),
+                    "LAT":  pd.to_numeric(df2[lat_col2],  errors="coerce"),
+                    "LONG": pd.to_numeric(df2[long_col2], errors="coerce"),
+                    "Source": "WAM",
+                }).dropna(subset=["LAT", "LONG"]).drop_duplicates(subset=["Station"], keep="first")
+                parts.append(src2)
+                print(f"WAM control points loaded: {len(src2):,} stations from {secondary_path.name}")
+            else:
+                print(f"WARNING: Could not find LAT/LONG columns in {secondary_path}. Available: {list(df2.columns)}")
+        # silently skip if no --wam-csv and the Brazos fallback doesn't exist
+    else:
+        print("WAM control points skipped (USGS-only mode).")
+
+    if not parts:
+        raise RuntimeError(
+            "No gage stations were loaded. "
+            "Provide --gages-csv with a CSV containing Station, LAT, LONG columns."
+        )
+
+    pts = pd.concat(parts, ignore_index=True)
+    pts = pts.sort_values("Source").drop_duplicates(subset=["Station"], keep="first").reset_index(drop=True)
+    return pts
+
+
+def main() -> None:
+    args = _parse_args()
+    base_dir = Path(args.base_dir).resolve()
+    hsr_dir = base_dir / args.hsr
+
+    basin_gdf = _load_basin_polygon(base_dir, args.basin_shp, args.basin_field, args.basin_value)
+    hu4_gdbs = _discover_hu4_gdbs(base_dir, args.gdb_root, basin_gdf, args.hu4s)
+    hu4_codes = [code for code, _ in hu4_gdbs]
+    print(f"Selected HU4 geodatabases: {', '.join(hu4_codes)}")
+
+    flow_tbl, vaa_tbl, flow_geom = _load_basin_flowline_and_vaa(hu4_gdbs, basin_gdf, args.ths)
+    comids = flow_tbl["ComID"].to_numpy(dtype=np.int64)
+    print(f"Flowlines prepared: {len(flow_tbl):,} reaches")
+
+    station_points = _load_station_points_flexible(base_dir, args.gages_csv, args.wam_csv)
+    station_map = _map_stations_to_comid(flow_geom, station_points)
+    print(f"Station mappings prepared: {len(station_map):,} stations")
+    print(f"Station map unique COMIDs: {station_map['ComID'].nunique():,} / stations {len(station_map):,}")
+
+    if not args.apply:
+        print("Dry run complete. Re-run with --apply to write HSR files and catchment/map geometry.")
+        return
+
+    flow_dir = hsr_dir / "Flowlines"
+    gis_dir = hsr_dir / "GIS"
+    nlcd_dir = hsr_dir / "NLCD"
+    p_dir = hsr_dir / "PRISM" / "Precipitation"
+    t_dir = hsr_dir / "PRISM" / "Temperature"
+    wu_dir = hsr_dir / "WaterUse"
+    sf_dir = hsr_dir / "Streamflow"
+    gaged_dir = hsr_dir / "GagedCatchments"
+    for d in [flow_dir, gis_dir, nlcd_dir, p_dir, t_dir, wu_dir, sf_dir, gaged_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    station_comid_path = flow_dir / "StationComID.csv"
+    nhdflowline_path = flow_dir / "nhdflowline.txt"
+    xwalk_path = flow_dir / "GridCodeComID.txt"
+    vaa_path = gis_dir / "NHDFlowlineVAA.txt"
+    nlcd_path = nlcd_dir / "catchmentattributesnlcd.txt"
+    precip_path = p_dir / f"PrismPrecipWY{args.wy}.dat"
+    temp_path = t_dir / f"PrismTempAveWY{args.wy}.dat"
+    wu_path = wu_dir / "ComID_WU_All.dat"
+    dat_path = sf_dir / f"ComIDStationDAMoAnQ{args.wy}.dat"
+    da_path = sf_dir / "StationDASqMi.csv"
+    catchment_gpkg = base_dir / "inputData" / f"NHDPlusCatchment_{args.ths}.gpkg"
+
+    if args.apply:
+        for path in [station_comid_path, nhdflowline_path, xwalk_path, vaa_path, nlcd_path, precip_path, temp_path, wu_path, dat_path, da_path]:
+            _backup(path, suffix=f".pre{args.ths}.bak")
+
+    flow_tbl.to_csv(nhdflowline_path, index=False)
+    with xwalk_path.open("w", encoding="utf-8") as f:
+        f.write("GridCode,ComID\n")
+        pd.DataFrame({"GridCode": comids, "ComID": comids}).to_csv(f, index=False, header=False)
+    vaa_tbl[["ComID", "FromNode", "ToNode", "HydroSeq", "Divergence", "StartFlag"]].to_csv(vaa_path, index=False)
+
+    nlcd_raster_path = (base_dir / args.nlcd_raster).resolve()
+    if not nlcd_raster_path.exists():
+        raise FileNotFoundError(nlcd_raster_path)
+
+    nlcd_df = _build_real_nlcd(flow_geom, nlcd_raster_path)
+    nlcd_df.to_csv(nlcd_path, index=False)
+
+    precip_df, temp_df = _build_real_prism(base_dir, flow_geom, args.wy, args.prism_ppt_dir, args.prism_tmean_dir)
+    with precip_path.open("w", encoding="utf-8") as f:
+        f.write("PRISM precipitation\n")
+        f.write("Real Brazos full-basin raster-sampled dataset\n")
+        f.write("GridCode GCAreaSqMi PIn_01..PIn_13\n")
+        f.write("Units: source PRISM raster units\n")
+        precip_df.to_csv(f, index=False, header=False, sep=" ", float_format="%.6f")
+
+    with temp_path.open("w", encoding="utf-8") as f:
+        f.write("PRISM temperature\n")
+        f.write("Real Brazos full-basin raster-sampled dataset\n")
+        f.write("GridCode TdC_01..TdC_12\n")
+        f.write("Units: source PRISM raster units\n")
+        temp_df.to_csv(f, index=False, header=False, sep=" ", float_format="%.6f")
+
+    wu_df = pd.DataFrame({"ComID": comids})
+    for month in range(1, 13):
+        wu_df[f"WU{month:02d}"] = 0.0
+    wu_df.to_csv(wu_path, index=False, header=False, sep=" ")
+
+    station_map.to_csv(station_comid_path, index=False)
+    dat = _build_streamflow_dat_from_gages_csv(
+        base_dir=base_dir,
+        wy=args.wy,
+        station_map=station_map,
+        gages_csv=args.gages_csv,
+        units=args.gages_flow_units,
+        out_dat_path=dat_path,
+        out_da_path=da_path,
+    )
+
+    if dat.empty and dat_path.exists():
+        # Fallback for legacy projects that already provide ComIDStationDAMoAnQYYYY.dat.
+        dat = _read_streamflow_dat(dat_path)
+        sm = station_map[["Station", "ComID"]].rename(columns={"Station": "StaWY", "ComID": "ComID_new"})
+        sm["StaWY"] = sm["StaWY"].map(_norm_station_id)
+        dat["StaWY"] = dat["StaWY"].map(_norm_station_id)
+        dat = dat.merge(sm, on="StaWY", how="left")
+        dat["ComIDSta"] = np.where(dat["ComID_new"].notna(), dat["ComID_new"], dat["ComIDSta"])
+        dat = dat.drop(columns=["ComID_new"])
+        dat["ComIDSta"] = pd.to_numeric(dat["ComIDSta"], errors="coerce").fillna(0).astype(np.int64)
+        _write_streamflow_dat(dat, dat_path)
+
+        da = dat[["StaWY", "ComIDSta", "NWISArea"]].drop_duplicates(subset=["StaWY"], keep="first").copy()
+        da = da.rename(columns={"StaWY": "Station", "ComIDSta": "ComID", "NWISArea": "DASqMi"})
+        da.to_csv(da_path, index=False)
+    elif dat.empty:
+        da = pd.DataFrame(columns=["Station", "ComID", "DASqMi"])
+    else:
+        da = pd.read_csv(da_path) if da_path.exists() else pd.DataFrame(columns=["Station", "ComID", "DASqMi"])
+
+    reach_lookup = flow_geom.set_index("ComID")["ReachCode"].to_dict()
+    da_map = da.set_index("Station")["DASqMi"].to_dict() if not da.empty else {}
+    station_list_path = gaged_dir / "StationList.txt"
+    station_ids = station_map["Station"].astype(str).sort_values().tolist()
+    station_list_path.write_text("\n".join(station_ids) + "\n", encoding="utf-8")
+
+    for _, row in station_map.iterrows():
+        station = row["Station"]
+        comid = int(row["ComID"])
+        dasqmi = float(da_map.get(station, 1.0))
+        area_sqkm = max(0.01, dasqmi / SQKM_TO_SQMI)
+        reach = str(reach_lookup.get(comid, f"{args.ths}0000000000"))
+        out = gaged_dir / f"{station}.dat"
+        with out.open("w", encoding="utf-8") as f:
+            f.write("GridCode,ComID,AreaSqKm,ReachCode\n")
+            f.write(f"{comid},{comid},{area_sqkm:.6f},{reach}\n")
+
+    catch = flow_geom.rename(columns={"ComID": "NHDPlusID"}).copy()
+    catch["GridCode"] = catch["NHDPlusID"]
+    catch = catch[["NHDPlusID", "GridCode", "ReachCode", "OrigReachCode", "geometry"]]
+    catch.to_file(catchment_gpkg, driver="GPKG")
+
+    print(f"Wrote basin package for THS {args.ths} / {args.hsr}")
+    print(f"Catchment/map geometry: {catchment_gpkg}")
+    print(f"NLCD source: {nlcd_raster_path}")
+    print(f"PRISM sources: {(base_dir / args.prism_ppt_dir).resolve()} and {(base_dir / args.prism_tmean_dir).resolve()}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,160 @@
+"""
+Appendix 7. Associate NHDPlus Flowlines with Streamflow Gaging Stations
+(AFGenStrucData)
+
+Python translation of AFGenStrucData.
+
+Original MATLAB behavior:
+1. Read StationList.txt for all historically gaged stations in THS
+2. Initialize POA matrix if missing
+3. For each station, read upstream catchment/reach mapping from station .dat file
+4. Store station data in AFstruct(HSR)(iy,is) fields:
+   Station, GridCode, ComID, AreaSqKm, TotAreaSqMi, ReachCode, WaterUse
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+
+SQKM_TO_SQMI = 0.386102159
+
+
+@dataclass
+class StationCatchmentData:
+	station: str
+	gridcode: np.ndarray
+	comid: np.ndarray
+	area_sq_km: np.ndarray
+	tot_area_sq_mi: float
+	reachcode: np.ndarray
+	water_use: np.ndarray
+
+
+def _read_station_list(station_list_path: Path) -> list[str]:
+	if not station_list_path.exists():
+		raise FileNotFoundError(f"Missing station list: {station_list_path}")
+
+	stations = []
+	with station_list_path.open("r", encoding="utf-8") as f:
+		for line in f:
+			s = line.strip()
+			if s:
+				stations.append(s)
+	return stations
+
+
+def _read_station_dat(station_dat_path: Path) -> StationCatchmentData:
+	if not station_dat_path.exists():
+		raise FileNotFoundError(f"Missing station data file: {station_dat_path}")
+
+	# MATLAB: textread(..., '%u %u %f %s', 'delimiter', ',', 'headerlines', 1)
+	df = pd.read_csv(
+		station_dat_path,
+		skiprows=1,
+		header=None,
+		names=["GridCode", "ComID", "AreaSqKm", "ReachCode"],
+	)
+
+	gridcode = pd.to_numeric(df["GridCode"], errors="coerce").fillna(0).astype(np.int64).to_numpy()
+	comid = pd.to_numeric(df["ComID"], errors="coerce").fillna(0).astype(np.int64).to_numpy()
+	area_sq_km = pd.to_numeric(df["AreaSqKm"], errors="coerce").fillna(0.0).astype(float).to_numpy()
+	reachcode = df["ReachCode"].astype(str).str.strip().to_numpy()
+
+	return StationCatchmentData(
+		station=station_dat_path.stem,
+		gridcode=gridcode,
+		comid=comid,
+		area_sq_km=area_sq_km,
+		tot_area_sq_mi=float(area_sq_km.sum() * SQKM_TO_SQMI),
+		reachcode=reachcode,
+		water_use=np.zeros(12, dtype=float),
+	)
+
+
+def gen_struc_data(
+	base_dir: Path,
+	ths: str,
+	hsr: str,
+	wy: int,
+	iy: int,
+	ny: int,
+	afstruct: dict[str, dict[int, dict[int, Any]]] | None = None,
+	poa: np.ndarray | None = None,
+) -> tuple[dict[str, dict[int, dict[int, Any]]], np.ndarray, list[str]]:
+	"""
+	Build AFstruct entries for a specific water-year index.
+
+	Parameters
+	----------
+	base_dir
+		Base directory containing HSR*/GagedCatchments files.
+	ths
+		Target hydrologic subregion code (4-digit).
+	hsr
+		AFstruct top-level key (equivalent to MATLAB HSR variable, for example "HSR1207").
+	wy
+		Water year integer (informational/logging).
+	iy
+		1-based water-year index in POA.
+	ny
+		Number of years in period of analysis.
+	afstruct
+		Existing AFstruct dictionary. Created if None.
+	poa
+		Existing POA matrix (NStaTHS x Ny, int8). Created if None.
+
+	Returns
+	-------
+	(afstruct, poa, station_list)
+	"""
+	print("\nAFGenStrucData: Creating data structures for all gaging stations.")
+	print("Contains GridCode, ComID, AreaSqKm, and ReachCode sets for historically gaged basins.")
+
+	folder = base_dir / f"HSR{ths}" / "GagedCatchments"
+	station_list_path = folder / "StationList.txt"
+	stations = _read_station_list(station_list_path)
+	n_sta_ths = len(stations)
+
+	if poa is None:
+		poa = np.zeros((n_sta_ths, ny), dtype=np.int8)
+
+	if afstruct is None:
+		afstruct = {}
+	if hsr not in afstruct:
+		afstruct[hsr] = {}
+	if iy not in afstruct[hsr]:
+		afstruct[hsr][iy] = {}
+
+	for is_idx, station in enumerate(stations, start=1):
+		station_dat = folder / f"{station}.dat"
+		data = _read_station_dat(station_dat)
+
+		afstruct[hsr][iy][is_idx] = {
+			"Station": station,
+			"GridCode": data.gridcode,
+			"ComID": data.comid,
+			"AreaSqKm": data.area_sq_km,
+			"TotAreaSqMi": data.tot_area_sq_mi,
+			"ReachCode": data.reachcode,
+			"WaterUse": data.water_use,
+			"WY": wy,
+		}
+
+	return afstruct, poa, stations
+
+
+if __name__ == "__main__":
+	# Example placeholder run (adjust values/paths for your local setup).
+	_base = Path(".")
+	_ths = "1207"
+	_hsr = "HSR1207"
+	_wy = 2018
+	_iy = 1
+	_ny = 1
+	_ = (_base, _ths, _hsr, _wy, _iy, _ny)

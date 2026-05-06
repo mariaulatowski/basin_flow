@@ -1,0 +1,138 @@
+"""
+AFCallRegCheckBox — Python translation of MATLAB AFCallRegCheckBox appendix.
+
+This module applies one explanatory-variable checkbox selection (one ir step),
+updates the regression design matrix, and optionally refreshes the running
+boxplot of selected explanatory variables.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Dict, List
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+CHECKBOX_ORDER = [
+	"CB11", "CB12", "CB21", "CB22", "CB23", "CB31", "CB32", "CB33",
+	"CB41", "CB42", "CB43", "CB51", "CB61", "CB71", "CB81", "CB82",
+	"CB83", "CB84", "CB85", "CB91", "CB92", "CBPT", "CBTA", "CBPM",
+]
+
+
+@dataclass
+class RegCheckboxResult:
+	reg_design_mat: np.ndarray
+	cb_matrix: np.ndarray
+	reg_var_name: List[str]
+
+
+def call_reg_checkbox(
+	ir: int,
+	ny: int,
+	im: int,
+	nlcd_ths: np.ndarray,
+	prsm_prec_ths: np.ndarray,
+	prsm_temp_ths: np.ndarray,
+	p_in0: np.ndarray,
+	reg_design_mat: np.ndarray,
+	cb_matrix: np.ndarray,
+	reg_var_name: List[str],
+	gui_selector: Callable[[int, str], tuple[str, Dict[str, int]]],
+	make_plot: bool = True,
+) -> RegCheckboxResult:
+	"""Process one explanatory variable selection step.
+
+	Parameters
+	----------
+	ir:
+		0-based explanatory-variable index.
+	ny:
+		1-based water-year counter from MATLAB context. Current year index is ny-1.
+	im:
+		1-based water-year month index (Oct=1 ... Sep=12).
+	nlcd_ths:
+		NLCD explanatory matrix, shape (nTHS, 21).
+	prsm_prec_ths:
+		PRISM precipitation, shape (Ny, nTHS, 12).
+	prsm_temp_ths:
+		PRISM temperature, shape (Ny, nTHS, 12).
+	p_in0:
+		Previous-year precipitation, shape (nTHS, 12).
+	reg_design_mat:
+		Regression design matrix, shape (nTHS, Nr), updated in-place.
+	cb_matrix:
+		Checkbox matrix, shape (Nr, 24), updated in-place.
+	reg_var_name:
+		Variable names list length Nr, updated in-place.
+	gui_selector:
+		Callback implementing AFRegCheckBoxGUI behavior.
+		Signature: (ir, default_name) -> (var_name, checkbox_state_dict).
+	make_plot:
+		If True, update running boxplot of selected explanatory variables.
+	"""
+	default_name = f"Var{ir + 1:02d}"
+	var_name, state = gui_selector(ir, default_name)
+	reg_var_name[ir] = var_name
+
+	print(f"Returning from GUI after {ir + 1:2.0f} variable named {reg_var_name[ir]}")
+
+	# Build one checkbox row in fixed MATLAB order.
+	row = np.array([int(state.get(k, 0)) for k in CHECKBOX_ORDER], dtype=int)
+	cb_matrix[ir, :] = row
+
+	ndx_nlcd = np.flatnonzero(cb_matrix[ir, :21])
+	cbpt = int(state.get("CBPT", 0))
+	cbta = int(state.get("CBTA", 0))
+	cbpm = int(state.get("CBPM", 0))
+
+	print("Starting test of contents.")
+
+	# MATLAB: if ~isempty(NdxNLCD) && CBPT==0 && CBTA==0
+	if ndx_nlcd.size > 0 and cbpt == 0 and cbta == 0:
+		reg_design_mat[:, ir] = np.sum(nlcd_ths[:, ndx_nlcd], axis=1)
+
+	# MATLAB: elseif CBPT==1 && CBTA==0 && isempty(NdxNLCD)
+	elif cbpt == 1 and cbta == 0 and ndx_nlcd.size == 0:
+		print("Current monthly precipitation specified.")
+		reg_design_mat[:, ir] = prsm_prec_ths[ny - 1, :, im - 1]
+
+	# MATLAB: elseif CBPM==1 && CBPT==0 && CBTA==0 && isempty(NdxNLCD)
+	elif cbpm == 1 and cbpt == 0 and cbta == 0 and ndx_nlcd.size == 0:
+		print("Previous monthly precipitation specified.")
+		if ny == 1 and im == 1:
+			reg_design_mat[:, ir] = p_in0[:, 11]
+		elif im > 1:
+			reg_design_mat[:, ir] = prsm_prec_ths[ny - 1, :, im - 2]
+		else:
+			reg_design_mat[:, ir] = prsm_prec_ths[ny - 2, :, 11]
+
+	# MATLAB: elseif CBPT==0 && CBTA==1 && isempty(NdxNLCD)
+	elif cbpt == 0 and cbta == 1 and ndx_nlcd.size == 0:
+		print("Current monthly temperature specified.")
+		reg_design_mat[:, ir] = prsm_temp_ths[ny - 1, :, im - 1]
+
+	else:
+		raise ValueError(
+			f"Improper specification of explanatory variables for term {ir + 1}. "
+			"Select either NLCD group(s) OR one climate checkbox."
+		)
+
+	if make_plot:
+		fig, ax = plt.subplots(num=23, clear=True)
+		fig.canvas.manager.set_window_title("Distributions of Selected Explanatory Variables")
+		data = [reg_design_mat[:, k] for k in range(ir + 1)]
+		labels = reg_var_name[: ir + 1]
+		ax.boxplot(data, labels=labels)
+		ax.set_xlabel("EXPLANATORY VARIABLES")
+		ax.set_ylabel("MAGNITUDE, IN VARIABLES UNITS")
+		fig.tight_layout()
+		plt.show(block=False)
+
+	return RegCheckboxResult(
+		reg_design_mat=reg_design_mat,
+		cb_matrix=cb_matrix,
+		reg_var_name=reg_var_name,
+	)

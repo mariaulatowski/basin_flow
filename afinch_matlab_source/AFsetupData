@@ -1,0 +1,66 @@
+"""AFsetupData orchestration for yearly setup sequence."""
+
+from __future__ import annotations
+
+import calendar
+from dataclasses import dataclass
+from typing import Callable, Dict, Any
+
+
+@dataclass
+class SetupContext:
+    wy: int
+    days_in_mo: list[int]
+
+
+def setup_data(
+    wy1: int,
+    iy: int,
+    ths: str,
+    af_ver: str = "1d",
+    steps: Dict[str, Callable[[SetupContext], Any]] | None = None,
+) -> SetupContext:
+    """Run annual setup workflow with injectable step callbacks.
+
+    Parameters
+    ----------
+    wy1 : int
+        First water year.
+    iy : int
+        0-based year index.
+    ths : str
+        Target hydrologic subregion code.
+    af_ver : str
+        AFINCH version label (kept for parity with MATLAB naming).
+    steps : dict[str, callable]
+        Optional step callbacks keyed by names:
+        read_nlcd, read_prism_prec, gen_struc_data, read_inflow_wy,
+        sta_basin_grid, plot_areas_flows, yield_image, read_prism_temp.
+    """
+    wy = wy1 + iy
+    feb_days = 29 if calendar.isleap(wy) else 28
+    days_in_mo = [31, 30, 31, 31, feb_days, 31, 30, 31, 30, 31, 31, 30, 337 + feb_days]
+
+    print("-" * 67)
+    print(" AFINCH: Analysis of Flow in Networks of Channels for Water Year")
+    print(f" {wy} in Target Hydrologic Subregion (THS) {ths} (v{af_ver})")
+    print("-" * 67)
+
+    ctx = SetupContext(wy=wy, days_in_mo=days_in_mo)
+    steps = steps or {}
+
+    for key in (
+        "read_nlcd",
+        "read_prism_prec",
+        "gen_struc_data",
+        "read_inflow_wy",
+        "sta_basin_grid",
+        "plot_areas_flows",
+        "yield_image",
+        "read_prism_temp",
+    ):
+        fn = steps.get(key)
+        if fn is not None:
+            fn(ctx)
+
+    return ctx

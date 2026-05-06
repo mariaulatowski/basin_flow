@@ -1,0 +1,145 @@
+"""
+AFPlotQmMeaEst — Python translation of MATLAB AFPlotQmMeaEst.
+
+Plots monthly measured versus estimated adjusted incremental flows for one
+water year and stores month-wise Spearman correlations.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Sequence, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+def _average_ranks(values: np.ndarray) -> np.ndarray:
+	"""Return average ranks for values, matching Spearman tie handling."""
+	order = np.argsort(values, kind="mergesort")
+	sorted_vals = values[order]
+	ranks = np.empty(len(values), dtype=float)
+
+	start = 0
+	while start < len(values):
+		end = start + 1
+		while end < len(values) and sorted_vals[end] == sorted_vals[start]:
+			end += 1
+		avg_rank = (start + 1 + end) / 2.0
+		ranks[order[start:end]] = avg_rank
+		start = end
+	return ranks
+
+
+def _spearman_corr(x: np.ndarray, y: np.ndarray) -> float:
+	if len(x) < 2 or len(y) < 2:
+		return np.nan
+	xr = _average_ranks(np.asarray(x, dtype=float))
+	yr = _average_ranks(np.asarray(y, dtype=float))
+	xstd = np.std(xr)
+	ystd = np.std(yr)
+	if xstd == 0 or ystd == 0:
+		return np.nan
+	return float(np.corrcoef(xr, yr)[0, 1])
+
+
+def plot_qm_mea_est(
+	afstruct: Dict[str, Any],
+	hsr: str,
+	sta_hist: Sequence[Dict[str, Any]],
+	iy: int,
+	wy1: int,
+	ny: int,
+	month_name: Sequence[str],
+	s_rho: np.ndarray | None = None,
+	make_plot: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+	"""Plot monthly measured vs estimated adjusted incremental flows.
+
+	Parameters
+	----------
+	afstruct:
+		Station structure dictionary keyed as ``afstruct[hsr][iy][sta_ndx]``.
+	hsr:
+		Hydrologic subregion key.
+	sta_hist:
+		Per-water-year station history with ``StaNdx`` entries.
+	iy:
+		0-based water-year index.
+	wy1:
+		First water year in the analysis period.
+	ny:
+		Number of water years.
+	month_name:
+		Month labels in water-year order.
+	s_rho:
+		Optional existing Spearman correlation array of shape ``(Ny, 12)``.
+	make_plot:
+		If ``True``, create the 4x3 monthly scatter figure.
+	"""
+	wy = wy1 + iy
+	sta_ndx = np.asarray(sta_hist[iy]["StaNdx"], dtype=int)
+
+	q_est_adj_inc_iy = np.vstack([
+		np.asarray(afstruct[hsr][iy][idx]["QEstAdjInc"]).reshape(-1)[:12]
+		for idx in sta_ndx
+	])
+	q_mea_adj_inc_iy = np.vstack([
+		np.asarray(afstruct[hsr][iy][idx]["QMeaAdjInc"]).reshape(-1)[:12]
+		for idx in sta_ndx
+	])
+
+	if s_rho is None:
+		s_rho = np.zeros((ny, 12), dtype=float)
+
+	if not make_plot:
+		for im in range(12):
+			valid = (q_mea_adj_inc_iy[:, im] >= 0) & (q_est_adj_inc_iy[:, im] >= 0)
+			s_rho[iy, im] = _spearman_corr(q_mea_adj_inc_iy[valid, im], q_est_adj_inc_iy[valid, im])
+		return q_est_adj_inc_iy, q_mea_adj_inc_iy, s_rho
+
+	fig, axes = plt.subplots(4, 3, num=200, clear=True, figsize=(12, 10))
+	fig.canvas.manager.set_window_title(
+		f"Relation between the measured and estimated monthly adjusted incremental flows for WY {wy}"
+	)
+	axes = np.asarray(axes).reshape(4, 3)
+
+	for im in range(12):
+		ax = axes[im // 3, im % 3]
+		valid = (q_mea_adj_inc_iy[:, im] >= 0) & (q_est_adj_inc_iy[:, im] >= 0)
+		n_pos = int(np.count_nonzero(valid))
+		n_neg = int(len(valid) - n_pos)
+		if n_neg > 0:
+			print(
+				f"For WY= {wy}, iy= {iy + 1}, and im= {im + 1} there are {n_pos} "
+				f"positive indices and {n_neg} negative indices."
+			)
+
+		x = np.sqrt(q_mea_adj_inc_iy[valid, im])
+		y = np.sqrt(q_est_adj_inc_iy[valid, im])
+		ax.plot(x, y, "rx")
+		ax.set_title(f"{month_name[im]} {wy}")
+
+		s_rho[iy, im] = _spearman_corr(q_mea_adj_inc_iy[valid, im], q_est_adj_inc_iy[valid, im])
+
+		ylim = ax.get_ylim()
+		xlim = ax.get_xlim()
+		y_lo_lim = ylim[0] + 0.10 * (ylim[1] - ylim[0])
+		x_up_lim = xlim[1] - 0.22 * (xlim[1] - xlim[0])
+		ax.plot([xlim[0] + 1, xlim[1] - 1], [xlim[0] + 1, xlim[1] - 1], color="k")
+		ax.text(
+			x_up_lim * 0.95,
+			y_lo_lim * 1.05,
+			f"r_S^2= {s_rho[iy, im] ** 2:6.4f}",
+			fontsize=8,
+			color="r",
+		)
+
+		if im == 6:
+			ax.set_ylabel("SQUARE ROOT OF ESTIMATED FLOW, IN CUBIC FEET PER SECOND")
+		if im in (9, 10, 11):
+			ax.set_xlabel("SQUARE ROOT OF MEASURED FLOW, IN CUBIC FEET PER SECOND")
+
+	fig.tight_layout()
+	plt.show(block=False)
+
+	return q_est_adj_inc_iy, q_mea_adj_inc_iy, s_rho

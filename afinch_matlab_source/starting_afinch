@@ -1,0 +1,91 @@
+"""
+Appendix 1. Starting AFINCH (AFinch)
+AFinch is a product of the USGS National Water Availability and Use Program: Great Lakes
+Pilot. AFinch integrates monthly streamflow data at streamgages, monthly water use data,
+monthly precipitation and climatic data, and land cover characteristics to estimate monthly flows
+at NHDPlus flowlines and water yields in catchments within four-digit hydrologic units. David J.
+Holtschlag, USGS Michigan Water Science Center
+
+Startup AFinch Application
+Startup AFinch Application
+
+Determine if AFinch is initiated in the appropriate directory.
+"""
+
+import os
+import sys
+import pickle
+from pathlib import Path
+
+
+def startup_afinch(work_dir: Path = None) -> dict:
+    """
+    Initialize AFINCH application and optionally load workspace.
+    
+    Parameters
+    ----------
+    work_dir : Path, optional
+        Path to AFinch work directory. If None, uses current working directory.
+        
+    Returns
+    -------
+    dict
+        Workspace dictionary containing AFINCH state (or empty dict if new session).
+    """
+    if work_dir is None:
+        work_dir = Path.cwd()
+    
+    # Verify correct directory structure
+    work_dir = Path(work_dir)
+    if not ('AFinch' in work_dir.as_posix().upper() and 'AWORK' in work_dir.as_posix().upper()):
+        print("ERROR: AFinch was not initiated in the .../AFinch/AWork subdirectory.")
+        print(f"Current directory: {work_dir}")
+        print("Change to ...\\AFinch\\AWork and restart AFinch.")
+        return {}
+    
+    # Check if user wants to load existing workspace
+    print("\n" + "="*60)
+    print("AFINCH Startup")
+    print("="*60)
+    response = input("Load existing AFINCH workspace? (yes/no) [no]: ").strip().lower()
+    
+    workspace = {}
+    
+    if response in ['yes', 'y']:
+        workspace_name = input("Enter workspace filename (without extension): ").strip()
+        workspace_path = work_dir / f"{workspace_name}.pkl"
+        
+        if workspace_path.exists():
+            try:
+                with open(workspace_path, 'rb') as f:
+                    workspace = pickle.load(f)
+                print(f"Loaded workspace: {workspace_path}")
+            except Exception as e:
+                print(f"Error loading workspace: {e}")
+                workspace = {}
+        else:
+            print(f"Workspace not found: {workspace_path}")
+            workspace = {}
+    else:
+        print("Starting new AFINCH session.")
+    
+    # Store AFINCH version
+    afinch_version = '1d'
+    workspace['afinch_version'] = afinch_version
+    workspace['work_dir'] = str(work_dir)
+    
+    return workspace
+
+
+def save_workspace(workspace: dict, work_dir: Path, workspace_name: str = 'afinch_workspace') -> None:
+    """Save workspace to pickle file for later resumption."""
+    workspace_path = Path(work_dir) / f"{workspace_name}.pkl"
+    with open(workspace_path, 'wb') as f:
+        pickle.dump(workspace, f)
+    print(f"Workspace saved to {workspace_path}")
+
+
+if __name__ == '__main__':
+    ws = startup_afinch()
+    print(f"\nAFINCH Version: {ws.get('afinch_version', 'unknown')}")
+    print(f"Work Directory: {ws.get('work_dir', 'unknown')}")

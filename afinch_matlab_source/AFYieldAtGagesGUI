@@ -1,0 +1,153 @@
+"""
+AFYieldAtGagesGUI — Python translation of MATLAB AFYieldAtGagesGUI_v1d.
+
+GUI for selecting the month to display water yield at historically gaged
+stations and for launching a data-tip identification callback.
+"""
+
+from __future__ import annotations
+
+import tkinter as tk
+from tkinter import ttk
+from typing import Any, Callable, Optional
+
+
+MONTHS = [
+	(1, "October"),
+	(2, "November"),
+	(3, "December"),
+	(4, "January"),
+	(5, "February"),
+	(6, "March"),
+	(7, "April"),
+	(8, "May"),
+	(9, "June"),
+	(10, "July"),
+	(11, "August"),
+	(12, "September"),
+]
+
+
+class AFYieldAtGagesGUI:
+	def __init__(
+		self,
+		on_month_selected: Optional[Callable[[int], Any]] = None,
+		on_submit_datatip: Optional[Callable[..., None]] = None,
+		initial_datatip: str = "cursor_info",
+	) -> None:
+		self.on_month_selected = on_month_selected
+		self.on_submit_datatip = on_submit_datatip
+		self.last_month_result: Any = None
+
+		self.root = tk.Tk()
+		self.root.title("Monthly Water Yields at Gaging Stations")
+		self.root.geometry("640x260")
+		self.root.resizable(False, False)
+
+		self.target_month = tk.IntVar(value=0)
+		self.datatip_var = tk.StringVar(value=initial_datatip)
+
+		self._build_ui()
+
+	def _build_ui(self) -> None:
+		main = ttk.Frame(self.root, padding=12)
+		main.pack(fill=tk.BOTH, expand=True)
+
+		title = ttk.Label(
+			main,
+			text="Select Month to Display Water Yield",
+			font=("Arial", 12, "bold"),
+			foreground="#0033aa",
+			anchor="center",
+		)
+		title.pack(fill=tk.X, pady=(0, 10))
+
+		month_frame = ttk.Frame(main)
+		month_frame.pack(fill=tk.X, pady=(0, 12))
+
+		for idx, (month_id, month_name) in enumerate(MONTHS):
+			row = idx // 4
+			col = idx % 4
+			rb = ttk.Radiobutton(
+				month_frame,
+				text=month_name,
+				value=month_id,
+				variable=self.target_month,
+				command=self._month_callback,
+			)
+			rb.grid(row=row, column=col, padx=10, pady=4, sticky="w")
+
+		info_row = ttk.Frame(main)
+		info_row.pack(fill=tk.X, pady=(6, 6))
+		ttk.Label(
+			info_row,
+			text="Variable name of digitized data tip:",
+			font=("Arial", 10, "bold"),
+			foreground="#0033aa",
+		).pack(side=tk.LEFT)
+		ttk.Entry(info_row, textvariable=self.datatip_var, width=24).pack(side=tk.LEFT, padx=(8, 0))
+
+		info2_row = ttk.Frame(main)
+		info2_row.pack(fill=tk.X, pady=(0, 10))
+		ttk.Label(
+			info2_row,
+			text="ID Station Year of data tip:",
+			font=("Arial", 10, "bold"),
+			foreground="#0033aa",
+		).pack(side=tk.LEFT)
+
+		submit_row = ttk.Frame(main)
+		submit_row.pack(fill=tk.X)
+		ttk.Button(submit_row, text="Submit", command=self._submit_callback).pack(side=tk.RIGHT)
+
+	def _month_callback(self) -> None:
+		month_id = int(self.target_month.get())
+		month_name = MONTHS[month_id - 1][1]
+		print(f"{month_name} selected.")
+
+		if self.on_month_selected is not None:
+			self.last_month_result = self.on_month_selected(month_id)
+
+		# Mirror MATLAB behavior that resets button state after triggering.
+		self.target_month.set(0)
+
+	def _submit_callback(self) -> None:
+		datatip = self.datatip_var.get().strip()
+		print(f"DataTip: {datatip}")
+		if self.on_submit_datatip is not None:
+			# Preferred callback contract includes month context from the latest selection.
+			try:
+				self.on_submit_datatip(datatip, self.last_month_result)
+			except TypeError:
+				# Backward-compatible one-argument callback.
+				self.on_submit_datatip(datatip)
+
+	def run(self) -> None:
+		self.root.mainloop()
+
+
+def launch_yield_at_gages_gui(
+	on_month_selected: Optional[Callable[[int], Any]] = None,
+	on_submit_datatip: Optional[Callable[..., None]] = None,
+	initial_datatip: str = "cursor_info",
+) -> AFYieldAtGagesGUI:
+	"""Create and run AFYieldAtGages GUI.
+
+	Parameters
+	----------
+	on_month_selected:
+		Callback invoked with target month index 1..12.
+		Intended to replace MATLAB's AFImagePOAYield_v1d call.
+	on_submit_datatip:
+		Callback invoked with datatip variable name.
+		Intended to replace MATLAB's AFid_v1d(datatip) call.
+	initial_datatip:
+		Initial text in the data-tip entry.
+	"""
+	gui = AFYieldAtGagesGUI(
+		on_month_selected=on_month_selected,
+		on_submit_datatip=on_submit_datatip,
+		initial_datatip=initial_datatip,
+	)
+	gui.run()
+	return gui

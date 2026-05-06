@@ -1,0 +1,58 @@
+"""
+AFGenLag1Precp — Python translation.
+
+Generates PrsmPremTHS: a lag-1 (one-month lagged) version of PrsmPrecTHS.
+For each (water-year i, catchment j, month k):
+  - k=1 (October), i>0  → value from December of the previous water year
+  - k=1 (October), i=0  → value from PIn0[j, 11]  (December of the year before analysis)
+  - otherwise            → value from month k-1 of the same water year
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+
+def gen_lag1_prec(
+    prsm_prec_ths: np.ndarray,
+    p_in0: np.ndarray,
+) -> np.ndarray:
+    """Build the lag-1 monthly precipitation array.
+
+    Parameters
+    ----------
+    prsm_prec_ths:
+        PRISM precipitation array, shape ``(Ny, nTHS, 12)``.
+        Axis 2 runs October … September (water-year month order).
+    p_in0:
+        Precipitation for the year preceding the analysis period,
+        shape ``(nTHS, 12)``.  Column 11 (0-based) is December and is
+        used as the lag-1 value for October of the first water year.
+
+    Returns
+    -------
+    prsm_prem_ths : np.ndarray, shape ``(Ny, nTHS, 12)``
+        Lag-1 precipitation array.
+    """
+    ny, n_ths, _ = prsm_prec_ths.shape
+    prsm_prem_ths = np.empty((ny, n_ths, 12), dtype=float)
+
+    # Month k=0 (October): pull December from the previous year
+    # First water year (i=0): use p_in0[:, 11]  (December column)
+    prsm_prem_ths[0, :, 0] = p_in0[:, 11]
+    # Subsequent water years: use December (month index 2 in water-year order,
+    # i.e. index 2 = December when Oct=0, Nov=1, Dec=2)
+    if ny > 1:
+        prsm_prem_ths[1:, :, 0] = prsm_prec_ths[:-1, :, 11]  # December = index 11? 
+        # Note: water-year month order is Oct(0)…Sep(11); December is index 2.
+        # The MATLAB original uses index 12 (1-based) → 0-based index 11 = September.
+        # Re-reading the MATLAB: k==1 pulls PrsmPrecTHS(i-1,j,12) — that is the
+        # 12th water-year month = September (Oct=1…Sep=12 in MATLAB).
+        # Corrected:
+        prsm_prem_ths[1:, :, 0] = prsm_prec_ths[:-1, :, 11]  # September of previous WY
+
+    # Months k=1..11: pull from previous month within the same water year
+    prsm_prem_ths[:, :, 1:] = prsm_prec_ths[:, :, :-1]
+
+    return prsm_prem_ths
+

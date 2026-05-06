@@ -1,0 +1,155 @@
+"""
+AFRegCheckBoxGUI — Python translation of MATLAB AFRegCheckBoxGUI.
+
+Provides a GUI for selecting explanatory variables used in regression.
+Primary API:
+    run_reg_checkbox_gui(ir: int, default_name: str) -> tuple[str, dict[str, int]]
+
+Returned dict keys match MATLAB checkbox names:
+CB11..CB92, CBPT, CBTA, CBPM
+"""
+
+from __future__ import annotations
+
+import tkinter as tk
+from tkinter import ttk
+from typing import Dict, Tuple
+
+
+NLCD_ITEMS = [
+    ("CB11", "11 Open Water"),
+    ("CB12", "12 Perennial Ice/Snow"),
+    ("CB21", "21 Low Intensity Residential"),
+    ("CB22", "22 High Intensity Residential"),
+    ("CB23", "23 Commercial/Industrial/Transportation"),
+    ("CB31", "31 Bare Rock/Sand/Clay"),
+    ("CB32", "32 Quarries/Strip Mines/Gravel Pits"),
+    ("CB33", "33 Transitional"),
+    ("CB41", "41 Deciduous Forest"),
+    ("CB42", "42 Evergreen Forest"),
+    ("CB43", "43 Mixed Forest"),
+    ("CB51", "51 Shrubland"),
+    ("CB61", "61 Orchards/Vineyards/Other"),
+    ("CB71", "71 Grasslands/Herbaceous"),
+    ("CB81", "81 Pasture/Hay"),
+    ("CB82", "82 Row Crops"),
+    ("CB83", "83 Small Grains"),
+    ("CB84", "84 Fallow"),
+    ("CB85", "85 Urban/Recreational Grasses"),
+    ("CB91", "91 Woody Wetlands"),
+    ("CB92", "92 Emergent Herbaceous Wetlands"),
+]
+
+CLIMATE_ITEMS = [
+    ("CBPT", "Concurrent Monthly Total (PRISM Precipitation)"),
+    ("CBPM", "Preceding Monthly Total (PRISM Precipitation)"),
+    ("CBTA", "Concurrent Monthly Average (PRISM Temperature)"),
+]
+
+ALL_KEYS = [k for k, _ in NLCD_ITEMS] + [k for k, _ in CLIMATE_ITEMS]
+
+
+class AFRegCheckBoxGUI:
+    def __init__(self, ir: int, default_name: str):
+        self.ir = ir
+        self.default_name = default_name
+        self._submitted = False
+
+        self.root = tk.Tk()
+        self.root.title("AFINCH: Selection of Explanatory Variables for Regression")
+        self.root.geometry("880x760")
+
+        self._vars: Dict[str, tk.IntVar] = {k: tk.IntVar(value=0) for k in ALL_KEYS}
+        self._name_var = tk.StringVar(value=default_name)
+
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        frm = ttk.Frame(self.root, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        title = ttk.Label(
+            frm,
+            text=f"Explanatory Variable {self.ir + 1}",
+            font=("Segoe UI", 14, "bold"),
+            anchor="center",
+        )
+        title.pack(fill=tk.X, pady=(0, 8))
+
+        subtitle = ttk.Label(
+            frm,
+            text="NLCD National Land Cover Dataset (1992)",
+            font=("Segoe UI", 11, "bold"),
+        )
+        subtitle.pack(anchor="w", pady=(0, 6))
+
+        nlcd_frame = ttk.Frame(frm)
+        nlcd_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # Split NLCD items into 2 columns for readability.
+        mid = (len(NLCD_ITEMS) + 1) // 2
+        left_items = NLCD_ITEMS[:mid]
+        right_items = NLCD_ITEMS[mid:]
+
+        left_col = ttk.Frame(nlcd_frame)
+        left_col.grid(row=0, column=0, sticky="nw", padx=(0, 24))
+        right_col = ttk.Frame(nlcd_frame)
+        right_col.grid(row=0, column=1, sticky="nw")
+
+        for key, label in left_items:
+            ttk.Checkbutton(left_col, text=label, variable=self._vars[key]).pack(anchor="w")
+        for key, label in right_items:
+            ttk.Checkbutton(right_col, text=label, variable=self._vars[key]).pack(anchor="w")
+
+        climate_title = ttk.Label(
+            frm,
+            text="PRISM Climatic Variables",
+            font=("Segoe UI", 11, "bold"),
+        )
+        climate_title.pack(anchor="w", pady=(4, 6))
+
+        for key, label in CLIMATE_ITEMS:
+            ttk.Checkbutton(frm, text=label, variable=self._vars[key]).pack(anchor="w")
+
+        name_row = ttk.Frame(frm)
+        name_row.pack(fill=tk.X, pady=(14, 8))
+        ttk.Label(name_row, text="Variable name:").pack(side=tk.LEFT)
+        ttk.Entry(name_row, textvariable=self._name_var, width=36).pack(side=tk.LEFT, padx=(8, 0))
+
+        btn_row = ttk.Frame(frm)
+        btn_row.pack(fill=tk.X)
+        ttk.Button(btn_row, text="Submit", command=self._on_submit).pack(side=tk.RIGHT)
+        ttk.Button(btn_row, text="Cancel", command=self._on_cancel).pack(side=tk.RIGHT, padx=(0, 8))
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+    def _on_submit(self) -> None:
+        self._submitted = True
+        self.root.destroy()
+
+    def _on_cancel(self) -> None:
+        self._submitted = False
+        self.root.destroy()
+
+    def run(self) -> Tuple[str, Dict[str, int]]:
+        self.root.mainloop()
+        if not self._submitted:
+            raise RuntimeError("Selection dialog was cancelled.")
+
+        var_name = self._name_var.get().strip() or self.default_name
+        states = {k: int(v.get()) for k, v in self._vars.items()}
+        return var_name, states
+
+
+def run_reg_checkbox_gui(ir: int, default_name: str) -> Tuple[str, Dict[str, int]]:
+    """Launch the explanatory-variable selection GUI and return selections.
+
+    Parameters
+    ----------
+    ir:
+        0-based variable index.
+    default_name:
+        Default variable label, typically "VarXX".
+    """
+    gui = AFRegCheckBoxGUI(ir=ir, default_name=default_name)
+    return gui.run()

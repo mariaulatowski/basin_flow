@@ -1,0 +1,516 @@
+"""AFINCH main GUI (Python Tkinter implementation).
+
+This GUI is prefilled for the Jan 2018 run used in this workspace and lets
+you change model/map options before executing.
+"""
+
+from __future__ import annotations
+
+import pickle
+import queue
+import subprocess
+import sys
+import threading
+from contextlib import redirect_stderr, redirect_stdout
+import tkinter as tk
+import webbrowser
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
+from typing import Any, Dict, Callable
+
+
+class AFinchGUI:
+    WINDOW_WIDTH = 900
+    WINDOW_HEIGHT = 760
+    WINDOW_X = 400
+    WINDOW_Y = 120
+    BG_COLOR = "#ECC982"
+    TITLE_COLOR = "#0000FF"
+    LABEL_FONT = ("Arial", 10, "bold")
+    TITLE_FONT = ("Arial", 16, "bold")
+
+    def __init__(self, afinch_version: str = "1d"):
+        self.afinch_version = afinch_version
+        self.root = tk.Tk()
+        self.root.title("USGS: NATIONAL WATER AVAILABILITY AND USE PROGRAM")
+        self.root.geometry(f"{self.WINDOW_WIDTH}x{self.WINDOW_HEIGHT}+{self.WINDOW_X}+{self.WINDOW_Y}")
+        self.root.configure(bg=self.BG_COLOR)
+
+        self._log_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self._is_running = False
+        self._run_thread: threading.Thread | None = None
+
+        self.state = {
+            "base_dir": tk.StringVar(value=r"c:\Users\mu3575\Documents\WAM"),
+            "ths_number": tk.StringVar(value="1200"),
+            "ths_name": tk.StringVar(value="Brazos"),
+            "hsr_key": tk.StringVar(value="HSR1200"),
+            "wy_start": tk.StringVar(value="2018"),
+            "wy_end": tk.StringVar(value="2018"),
+            "ny": tk.StringVar(value="1"),
+            "map_year": tk.StringVar(value="2018"),
+            "map_month": tk.StringVar(value="1"),
+            "map_output_dir": tk.StringVar(value=r"output/nhd_medium_usgs_wam"),
+            "build_map": tk.BooleanVar(value=True),
+            "open_map": tk.BooleanVar(value=True),
+        }
+        self.callbacks: Dict[str, Callable] = {}
+        self.run_button: ttk.Button | None = None
+        self.map_button: ttk.Button | None = None
+        self.step_buttons: dict[int, ttk.Button] = {}
+        self.log_box: scrolledtext.ScrolledText | None = None
+        self._pipeline: Any = None
+        self._pipeline_signature: tuple[str, str, str, int, int] | None = None
+        self._completed_steps: set[int] = set()
+
+        self._build_gui()
+        self.root.after(150, self._drain_log_queue)
+
+    def _build_gui(self):
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        title_label = ttk.Label(
+            main_frame,
+            text="AFINCH: Analysis of Flow in Networks of Channels",
+            font=self.TITLE_FONT,
+            foreground=self.TITLE_COLOR,
+        )
+        title_label.pack(pady=(0, 12))
+
+        cfg = ttk.LabelFrame(main_frame, text="Run Configuration (prefilled for Jan 2018)", padding=10)
+        cfg.pack(fill="x", pady=(0, 8))
+
+        self._add_labeled_entry(cfg, "Base Directory", "base_dir", 0, browse=True)
+        self._add_labeled_entry(cfg, "THS Number", "ths_number", 1)
+        self._add_labeled_entry(cfg, "THS Name", "ths_name", 2)
+        self._add_labeled_entry(cfg, "HSR Key", "hsr_key", 3)
+        self._add_labeled_entry(cfg, "WY Start", "wy_start", 4)
+        self._add_labeled_entry(cfg, "WY End", "wy_end", 5)
+        self._add_labeled_entry(cfg, "Number of Years (NY)", "ny", 6)
+
+        map_cfg = ttk.LabelFrame(main_frame, text="Map Options", padding=10)
+        map_cfg.pack(fill="x", pady=(0, 8))
+        self._add_labeled_entry(map_cfg, "Map Year", "map_year", 0)
+        self._add_labeled_entry(map_cfg, "Map Month (1-12)", "map_month", 1)
+        self._add_labeled_entry(map_cfg, "Map Output Dir", "map_output_dir", 2)
+
+        check_row = ttk.Frame(map_cfg)
+        check_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(check_row, text="Build Map After Model Run", variable=self.state["build_map"]).pack(side="left", padx=(0, 20))
+        ttk.Checkbutton(check_row, text="Open Map After Build", variable=self.state["open_map"]).pack(side="left")
+
+        actions = ttk.Frame(main_frame)
+        actions.pack(fill="x", pady=(2, 8))
+        self.run_button = ttk.Button(actions, text="Run Full Model", command=self._start_full_run)
+        self.run_button.pack(side="left", padx=(0, 6))
+        self.map_button = ttk.Button(actions, text="Build Map Only", command=self._start_map_only)
+        self.map_button.pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="Reset Step State", command=self._reset_step_state).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="Save Workspace", command=self._save_workspace).pack(side="right", padx=4)
+        ttk.Button(actions, text="Close", command=self._close_app).pack(side="right", padx=4)
+
+        step_frame = ttk.LabelFrame(main_frame, text="Step-by-Step Workflow (MATLAB-style)", padding=10)
+        step_frame.pack(fill="x", pady=(0, 8))
+        steps = [
+            (1, "1) Setup Inputs"),
+            (2, "2) Run Regression"),
+            (3, "3) Estimate Incremental"),
+            (4, "4) Constrain Incremental"),
+            (5, "5) Write Incremental Output"),
+            (6, "6) Accumulate Flow"),
+            (7, "7) Build Map"),
+        ]
+        for idx, (step_no, label) in enumerate(steps):
+            btn = ttk.Button(step_frame, text=label, command=lambda s=step_no: self._start_step_run(s))
+            btn.grid(row=idx // 4, column=idx % 4, padx=4, pady=3, sticky="ew")
+            self.step_buttons[step_no] = btn
+        for col in range(4):
+            step_frame.grid_columnconfigure(col, weight=1)
+
+        log_frame = ttk.LabelFrame(main_frame, text="Run Log", padding=8)
+        log_frame.pack(fill="both", expand=True)
+        self.log_box = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=22, font=("Consolas", 9))
+        self.log_box.pack(fill="both", expand=True)
+        self._append_log("GUI initialized with Jan 2018 defaults.\n")
+
+        footer = ttk.Label(main_frame, text=f"AFINCH GUI v{self.afinch_version}", font=("Arial", 8))
+        footer.pack(anchor="w", pady=(4, 0))
+
+    def _add_labeled_entry(self, parent: ttk.LabelFrame, label: str, state_key: str, row: int, browse: bool = False):
+        ttk.Label(parent, text=label, font=self.LABEL_FONT).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
+        ent = ttk.Entry(parent, textvariable=self.state[state_key], width=70 if browse else 32)
+        ent.grid(row=row, column=1, sticky="w", pady=3)
+        if browse:
+            ttk.Button(parent, text="Browse", command=self._browse_base_dir).grid(row=row, column=2, sticky="w", padx=(8, 0))
+
+    def _browse_base_dir(self):
+        selected = filedialog.askdirectory(title="Select AFINCH Base Directory")
+        if selected:
+            self.state["base_dir"].set(selected)
+
+    def _enqueue_log(self, text: str):
+        self._log_queue.put(("log", text))
+
+    def _enqueue_open_map(self, path: Path):
+        self._log_queue.put(("open_map", str(path)))
+
+    def _drain_log_queue(self):
+        try:
+            while True:
+                typ, payload = self._log_queue.get_nowait()
+                if typ == "log":
+                    self._append_log(payload)
+                elif typ == "open_map":
+                    self._append_log(f"Opening map: {payload}\n")
+                    webbrowser.open(Path(payload).as_uri())
+        except queue.Empty:
+            pass
+        finally:
+            self.root.after(150, self._drain_log_queue)
+
+    def _append_log(self, text: str):
+        if self.log_box is None:
+            return
+        self.log_box.insert(tk.END, text)
+        self.log_box.see(tk.END)
+        self.log_box.update_idletasks()
+
+    def _set_running(self, running: bool):
+        self._is_running = running
+        if self.run_button is not None:
+            self.run_button.configure(state=tk.DISABLED if running else tk.NORMAL)
+        if self.map_button is not None:
+            self.map_button.configure(state=tk.DISABLED if running else tk.NORMAL)
+        for btn in self.step_buttons.values():
+            btn.configure(state=tk.DISABLED if running else tk.NORMAL)
+
+    def _step_dependency(self, step_no: int) -> int | None:
+        deps = {2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6}
+        return deps.get(step_no)
+
+    def _pipeline_sig(self, cfg: dict) -> tuple[str, str, str, int, int]:
+        return (
+            str(cfg["base_dir"]),
+            cfg["ths"],
+            cfg["hsr_key"],
+            int(cfg["wy_start"]),
+            int(cfg["ny"]),
+        )
+
+    def _reset_step_state(self):
+        if self._is_running:
+            messagebox.showwarning("AFINCH Busy", "Cannot reset while a run is in progress.")
+            return
+        self._pipeline = None
+        self._pipeline_signature = None
+        self._completed_steps.clear()
+        self._append_log("Step pipeline state reset. Run Step 1 to begin.\n")
+
+    def _ensure_pipeline(self, cfg: dict, *, force_new: bool = False):
+        sig = self._pipeline_sig(cfg)
+        needs_new = force_new or self._pipeline is None or self._pipeline_signature != sig
+        if not needs_new:
+            return
+
+        base_dir: Path = cfg["base_dir"]
+        runner_path = base_dir / "afinch_python_modules" / "run_converted_afinch_full_model.py"
+        if not runner_path.exists():
+            raise FileNotFoundError(f"Runner not found: {runner_path}")
+
+        self._enqueue_log(f"Loading step runner: {runner_path}\n")
+        mod = self._load_py_module("afinch_gui_step_runner", runner_path)
+        self._pipeline = mod.ConvertedAFinchPipeline(
+            base_dir=cfg["base_dir"],
+            src_dir=cfg["base_dir"] / "afinch_matlab_source",
+            ths=cfg["ths"],
+            hsr_key=cfg["hsr_key"],
+            wy1=cfg["wy_start"],
+            ny=cfg["ny"],
+            logger=self._enqueue_log,
+        )
+        self._pipeline_signature = sig
+        self._completed_steps.clear()
+        self._enqueue_log("Step pipeline initialized.\n")
+
+    def _run_step(self, cfg: dict, step_no: int):
+        dep = self._step_dependency(step_no)
+        if dep is not None and dep not in self._completed_steps:
+            raise RuntimeError(f"Step {dep} must be completed before Step {step_no}.")
+
+        if step_no == 1:
+            self._ensure_pipeline(cfg, force_new=True)
+            self._pipeline.step_setup_inputs()
+        elif step_no == 2:
+            self._ensure_pipeline(cfg)
+            self._pipeline.step_run_regression()
+        elif step_no == 3:
+            self._ensure_pipeline(cfg)
+            self._pipeline.step_estimate_incremental()
+        elif step_no == 4:
+            self._ensure_pipeline(cfg)
+            self._pipeline.step_constrain_incremental()
+        elif step_no == 5:
+            self._ensure_pipeline(cfg)
+            self._pipeline.step_write_incremental_output()
+        elif step_no == 6:
+            self._ensure_pipeline(cfg)
+            self._pipeline.step_accumulate_flow()
+        elif step_no == 7:
+            self._run_map(cfg)
+        else:
+            raise ValueError(f"Unknown step number: {step_no}")
+
+        if step_no == 1:
+            self._completed_steps = {1}
+        else:
+            self._completed_steps.add(step_no)
+
+        completed = ", ".join(str(x) for x in sorted(self._completed_steps))
+        self._enqueue_log(f"Completed steps: {completed}\n")
+
+    def _start_step_run(self, step_no: int):
+        if self._is_running:
+            messagebox.showwarning("AFINCH Busy", "A run is already in progress.")
+            return
+        try:
+            cfg = self._validate_inputs()
+        except Exception as e:
+            messagebox.showerror("Input Error", str(e))
+            return
+
+        def worker():
+            try:
+                self._enqueue_log(f"\n=== STEP {step_no} START ===\n")
+                self._run_step(cfg, step_no)
+                self._enqueue_log(f"=== STEP {step_no} COMPLETE ===\n")
+            except Exception as exc:
+                self._enqueue_log(f"ERROR: {exc}\n")
+                self._show_error("Step Error", str(exc))
+            finally:
+                self.root.after(0, lambda: self._set_running(False))
+
+        self._set_running(True)
+        self._run_thread = threading.Thread(target=worker, daemon=True)
+        self._run_thread.start()
+
+    def _show_error(self, title: str, message: str):
+        self.root.after(0, lambda: messagebox.showerror(title, message))
+
+    def _validate_inputs(self) -> dict:
+        base_dir = Path(self.state["base_dir"].get().strip())
+        if not base_dir.exists():
+            raise FileNotFoundError(f"Base directory not found: {base_dir}")
+
+        wy_start = int(self.state["wy_start"].get().strip())
+        wy_end = int(self.state["wy_end"].get().strip())
+        ny = int(self.state["ny"].get().strip())
+        map_year = int(self.state["map_year"].get().strip())
+        map_month = int(self.state["map_month"].get().strip())
+        if not (1 <= map_month <= 12):
+            raise ValueError("Map month must be in 1..12.")
+        if wy_end < wy_start:
+            raise ValueError("WY End must be greater than or equal to WY Start.")
+        if ny < 1:
+            raise ValueError("NY must be at least 1.")
+
+        return {
+            "base_dir": base_dir,
+            "ths": self.state["ths_number"].get().strip(),
+            "hsr_key": self.state["hsr_key"].get().strip(),
+            "wy_start": wy_start,
+            "wy_end": wy_end,
+            "ny": ny,
+            "map_year": map_year,
+            "map_month": map_month,
+            "map_output_dir": self.state["map_output_dir"].get().strip(),
+            "build_map": bool(self.state["build_map"].get()),
+            "open_map": bool(self.state["open_map"].get()),
+        }
+
+    def _load_py_module(self, module_name: str, path: Path):
+        loader = SourceFileLoader(module_name, str(path))
+        spec = spec_from_loader(module_name, loader)
+        if spec is None:
+            raise RuntimeError(f"No module spec for {path}")
+        mod = module_from_spec(spec)
+        # Register the module before execution so decorators (for example dataclass)
+        # can resolve module globals through sys.modules during import.
+        sys.modules[module_name] = mod
+        loader.exec_module(mod)
+        return mod
+
+    def _run_model(self, cfg: dict):
+        base_dir: Path = cfg["base_dir"]
+        runner_path = base_dir / "afinch_python_modules" / "run_converted_afinch_full_model.py"
+        if not runner_path.exists():
+            raise FileNotFoundError(f"Runner not found: {runner_path}")
+
+        self._enqueue_log(f"Loading model runner: {runner_path}\n")
+        mod = self._load_py_module("afinch_gui_runner", runner_path)
+        mod.ROOT = base_dir
+        mod.SRC = base_dir / "afinch_matlab_source"
+        mod.THS = cfg["ths"]
+        mod.HSR_KEY = cfg["hsr_key"]
+        mod.WY1 = cfg["wy_start"]
+        mod.NY = cfg["ny"]
+
+        self._enqueue_log(
+            f"Running full model with THS={mod.THS}, HSR={mod.HSR_KEY}, "
+            f"WY1={mod.WY1}, NY={mod.NY}, BASE={mod.ROOT}\n"
+        )
+        class _QueueWriter:
+            def __init__(self, push):
+                self._push = push
+
+            def write(self, data: str):
+                if data:
+                    self._push(data)
+
+            def flush(self):
+                return None
+
+        qwriter = _QueueWriter(self._enqueue_log)
+        with redirect_stdout(qwriter), redirect_stderr(qwriter):
+            mod.run()
+        self._enqueue_log("Model run complete.\n")
+
+    def _run_map(self, cfg: dict):
+        base_dir: Path = cfg["base_dir"]
+        map_script = base_dir / "create_routed_flow_map.py"
+        if not map_script.exists():
+            raise FileNotFoundError(f"Map script not found: {map_script}")
+
+        cmd = [
+            sys.executable,
+            str(map_script),
+            "--output-dir",
+            cfg["map_output_dir"],
+            "--year",
+            str(cfg["map_year"]),
+            "--month",
+            str(cfg["map_month"]),
+            "--flow-source",
+            "afinch",
+            "--afinch-hsr",
+            cfg["hsr_key"],
+        ]
+        self._enqueue_log(f"Running map build:\n  {' '.join(cmd)}\n")
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(base_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            self._enqueue_log(line)
+        rc = proc.wait()
+        if rc != 0:
+            raise RuntimeError(f"Map build failed with exit code {rc}.")
+
+        map_path = base_dir / cfg["map_output_dir"] / f"nhd_{cfg['map_year']}{cfg['map_month']:02d}_flow_map.html"
+        self._enqueue_log(f"Map build complete: {map_path}\n")
+        if cfg["open_map"] and map_path.exists():
+            self._enqueue_open_map(map_path)
+
+    def _start_full_run(self):
+        if self._is_running:
+            messagebox.showwarning("AFINCH Busy", "A run is already in progress.")
+            return
+        try:
+            cfg = self._validate_inputs()
+        except Exception as e:
+            messagebox.showerror("Input Error", str(e))
+            return
+
+        def worker():
+            try:
+                self._enqueue_log("\n=== FULL RUN START ===\n")
+                self._run_model(cfg)
+                if cfg["build_map"]:
+                    self._run_map(cfg)
+                self._enqueue_log("=== FULL RUN COMPLETE ===\n")
+            except Exception as exc:
+                self._enqueue_log(f"ERROR: {exc}\n")
+                self._show_error("Run Error", str(exc))
+            finally:
+                self.root.after(0, lambda: self._set_running(False))
+
+        self._set_running(True)
+        self._run_thread = threading.Thread(target=worker, daemon=True)
+        self._run_thread.start()
+
+    def _start_map_only(self):
+        if self._is_running:
+            messagebox.showwarning("AFINCH Busy", "A run is already in progress.")
+            return
+        try:
+            cfg = self._validate_inputs()
+        except Exception as e:
+            messagebox.showerror("Input Error", str(e))
+            return
+
+        def worker():
+            try:
+                self._enqueue_log("\n=== MAP ONLY START ===\n")
+                self._run_map(cfg)
+                self._enqueue_log("=== MAP ONLY COMPLETE ===\n")
+            except Exception as exc:
+                self._enqueue_log(f"ERROR: {exc}\n")
+                self._show_error("Map Error", str(exc))
+            finally:
+                self.root.after(0, lambda: self._set_running(False))
+
+        self._set_running(True)
+        self._run_thread = threading.Thread(target=worker, daemon=True)
+        self._run_thread.start()
+
+    def _save_workspace(self):
+        filename = simpledialog.askstring("Save Workspace", "Enter filename (without extension):")
+        if filename:
+            workspace_data = {
+                "state": {
+                    k: (v.get() if hasattr(v, "get") else str(v))
+                    for k, v in self.state.items()
+                },
+                "version": self.afinch_version,
+            }
+            workspace_path = Path(filename).with_suffix(".pkl")
+            with open(workspace_path, "wb") as f:
+                pickle.dump(workspace_data, f)
+            messagebox.showinfo("Success", f"Workspace saved to {workspace_path}")
+
+    def _close_app(self):
+        if self._is_running:
+            messagebox.showwarning("Run In Progress", "Please wait for the current run to finish.")
+            return
+        response = messagebox.askyesnocancel("Close AFINCH", "Save workspace before closing?")
+        if response is True:
+            self._save_workspace()
+            self.root.quit()
+        elif response is False:
+            self.root.quit()
+
+    def register_callback(self, step_key: str, callback: Callable):
+        self.callbacks[step_key] = callback
+
+    def get_state(self) -> Dict[str, str]:
+        return {k: str(v.get()) for k, v in self.state.items()}
+
+    def update_state(self, **kwargs):
+        for key, value in kwargs.items():
+            if key in self.state:
+                self.state[key].set(value)
+
+    def run(self):
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    gui = AFinchGUI(afinch_version="1d")
+    gui.run()

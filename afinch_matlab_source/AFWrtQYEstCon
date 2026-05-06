@@ -1,0 +1,100 @@
+"""
+AFWrtQYEstCon — Python translation of MATLAB AFWrtQYEstCon.
+
+Writes unconstrained/constrained estimated flows and yields for one water
+year, and writes the station activity matrix at the end of the analysis.
+"""
+
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+from typing import Iterable, Sequence
+
+import numpy as np
+
+
+MONTH_ABBREV = ["Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep"]
+
+
+def _flow_yield_header() -> list[str]:
+	header = ["GridCode", "ComID", "AreaSqMi"]
+	for prefix in ("QEstAdj", "YEstAdj", "QConAdj", "YConAdj"):
+		header.extend(f"{prefix}{month}" for month in MONTH_ABBREV)
+	return header
+
+
+def write_qy_est_con(
+	base_dir: Path | str,
+	hsr: str,
+	ths: str,
+	iy: int,
+	wy1: int,
+	ny: int,
+	grid_code_ths: np.ndarray,
+	comid_ths: np.ndarray,
+	gc_area_sq_mi: np.ndarray,
+	q_est_adj_inc: np.ndarray,
+	y_est_adj_inc: np.ndarray,
+	q_con_adj_inc: np.ndarray,
+	y_con_adj_inc: np.ndarray,
+	sta_ths: Sequence[str] | None = None,
+	poa: np.ndarray | None = None,
+) -> Path:
+	"""Write yearly flow/yield estimates and optional StationPOA summary.
+
+	Parameters
+	----------
+	base_dir:
+		Root directory that contains the HSR output folder.
+	hsr:
+		Hydrologic subregion folder name.
+	ths:
+		THS identifier used in the status message.
+	iy:
+		0-based water-year index.
+	wy1:
+		First water year of analysis.
+	ny:
+		Total number of water years.
+	grid_code_ths, comid_ths, gc_area_sq_mi:
+		THS catchment descriptors, each shape ``(nTHS,)``.
+	q_est_adj_inc, y_est_adj_inc, q_con_adj_inc, y_con_adj_inc:
+		Arrays of shape ``(Ny, nTHS, 12)``.
+	sta_ths, poa:
+		Optional station IDs and period-of-analysis activity matrix.
+		When provided and ``iy == ny - 1``, StationPOA.csv is written.
+	"""
+	wy = wy1 + iy
+	output_dir = Path(base_dir) / hsr / "Output" / "FlowYield"
+	output_dir.mkdir(parents=True, exist_ok=True)
+
+	qy_path = output_dir / f"QY{hsr}WY{wy}.csv"
+	print(f"Saving QYHSR{ths}WY{wy}.csv")
+
+	with qy_path.open("w", newline="", encoding="utf-8") as fh:
+		writer = csv.writer(fh)
+		writer.writerow(_flow_yield_header())
+		n_ths = len(grid_code_ths)
+		for iths in range(n_ths):
+			row = [
+				int(grid_code_ths[iths]),
+				int(comid_ths[iths]),
+				float(gc_area_sq_mi[iths]),
+			]
+			row.extend(np.asarray(q_est_adj_inc[iy, iths, :], dtype=float).tolist())
+			row.extend(np.asarray(y_est_adj_inc[iy, iths, :], dtype=float).tolist())
+			row.extend(np.asarray(q_con_adj_inc[iy, iths, :], dtype=float).tolist())
+			row.extend(np.asarray(y_con_adj_inc[iy, iths, :], dtype=float).tolist())
+			writer.writerow(row)
+
+	if iy == ny - 1 and sta_ths is not None and poa is not None:
+		print("Writing station activity matrix (StationPOA.csv) for period of analysis.")
+		station_poa_path = output_dir / "StationPOA.csv"
+		with station_poa_path.open("w", newline="", encoding="utf-8") as fh:
+			writer = csv.writer(fh)
+			writer.writerow(["Site", *[f"WY{wy}" for wy in range(wy1, wy1 + ny)]])
+			for is_idx, site in enumerate(sta_ths):
+				writer.writerow([site, *np.asarray(poa[is_idx, :], dtype=int).tolist()])
+
+	return qy_path

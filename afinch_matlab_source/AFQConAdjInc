@@ -1,0 +1,95 @@
+"""
+AFQConAdjInc — Python translation of MATLAB AFQConAdjInc.
+
+Computes constrained adjusted incremental flows and yields by scaling
+catchment-level estimated flows so they sum to the measured adjusted
+incremental flow at each gaging station.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Sequence, Tuple
+
+import numpy as np
+
+
+_CFS_TO_IN_PER_SQMI = 24.0 * 3600.0 * 12.0 / (5280.0 ** 2)
+
+
+def q_con_adj_inc(
+	afstruct: Dict[str, Any],
+	hsr: str,
+	sta_hist: Sequence[Dict[str, Any]],
+	grid_code_ths: np.ndarray,
+	q_est_adj_inc: np.ndarray,
+	gc_area_sq_mi: np.ndarray,
+	days_in_mo: np.ndarray,
+) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
+	"""Constrain estimated incremental flows to measured station totals.
+
+	Parameters
+	----------
+	afstruct:
+		Station structure dictionary keyed as ``afstruct[hsr][iy][sta_ndx]``.
+	hsr:
+		Hydrologic subregion key.
+	sta_hist:
+		Per-water-year station history. Each entry must contain ``StaNdx``.
+	grid_code_ths:
+		THS catchment GridCode array, shape ``(nTHS,)``.
+	q_est_adj_inc:
+		Estimated adjusted incremental flows, shape ``(Ny, nTHS, 12)``.
+	gc_area_sq_mi:
+		Catchment areas, shape ``(nTHS,)``.
+	days_in_mo:
+		Water-year month lengths, shape ``(12,)`` or larger.
+
+	Returns
+	-------
+	afstruct, con_adjust, q_con_adj_inc, y_con_adj_inc
+		Updated station structure, station/month constraint ratios,
+		constrained flows, and constrained yields.
+	"""
+	ny, n_ths, _ = q_est_adj_inc.shape
+	max_stations = max(len(hist["StaNdx"]) for hist in sta_hist[:ny])
+
+	con_adjust = np.full((ny, max_stations, 12), np.nan, dtype=float)
+	q_constrained = np.zeros_like(q_est_adj_inc, dtype=float)
+	y_constrained = np.zeros_like(q_est_adj_inc, dtype=float)
+
+	area_sq_mi = np.asarray(gc_area_sq_mi, dtype=float)
+	dim = np.asarray(days_in_mo, dtype=float)
+
+	for iy in range(ny):
+		sta_ndx_list = np.asarray(sta_hist[iy]["StaNdx"], dtype=int)
+
+		for is_idx, sta_ndx in enumerate(sta_ndx_list):
+			station = afstruct[hsr][iy][sta_ndx]
+
+			_, _, ib = np.intersect1d(
+				np.asarray(station["SBGridCode"]),
+				grid_code_ths,
+				return_indices=True,
+			)
+
+			station_q_est = np.sum(q_est_adj_inc[iy, ib, :], axis=0)
+			station["QEstAdjInc"] = station_q_est.reshape(1, 12)
+
+			for im in range(12):
+				q_est_station = float(station_q_est[im])
+				q_mea_station = float(np.asarray(station["QMeaAdjInc"])[im])
+
+				if q_est_station == 0:
+					adjust = 0.0
+				else:
+					adjust = q_mea_station / q_est_station
+
+				con_adjust[iy, is_idx, im] = adjust
+				q_constrained[iy, ib, im] = adjust * q_est_adj_inc[iy, ib, im]
+				y_constrained[iy, ib, im] = (
+					q_constrained[iy, ib, im] / area_sq_mi[ib] / ((5280.0 ** 2) / (dim[im] * 24.0 * 3600.0 * 12.0))
+				)
+
+			afstruct[hsr][iy][sta_ndx] = station
+
+	return afstruct, con_adjust, q_constrained, y_constrained

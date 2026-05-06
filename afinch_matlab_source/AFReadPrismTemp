@@ -1,0 +1,207 @@
+"""
+AFReadPrismTemp — Python translation of MATLAB AFReadPrismTemp appendix.
+
+Sections:
+  1. Read monthly average PRISM temperature data for the current water year.
+  2. Initialise ArrayNLCD / PrsmPrec / PrsmTemp / PrsmTempTHS arrays on first call.
+  3. Store THS-grid temperature slice in PrsmTempTHS.
+  4. For each active station compute area-weighted NLCD land-cover fractions.
+  5. For each active station compute area-weighted PRISM precipitation and temperature.
+  6. Save AFstruct at end of last water year.
+"""
+
+from __future__ import annotations
+
+import pickle
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict
+
+import numpy as np
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# NLCD column names (21 classes in the source file)
+# ---------------------------------------------------------------------------
+NLCD_COLS = [
+    "NLCD11", "NLCD12",
+    "NLCD21", "NLCD22", "NLCD23",
+    "NLCD31", "NLCD32", "NLCD33",
+    "NLCD41", "NLCD42", "NLCD43",
+    "NLCD51", "NLCD61", "NLCD71",
+    "NLCD81", "NLCD82", "NLCD83", "NLCD84", "NLCD85",
+    "NLCD91", "NLCD92",
+]
+
+
+@dataclass
+class PrismTempResult:
+    """Return value of read_prism_temp()."""
+    afstruct: Dict[str, Any]          # updated station structure
+    array_nlcd: np.ndarray            # (Ny, nTHS, 21)  area-weighted NLCD fractions by THS catchment
+    prsm_prec: np.ndarray             # (Ny, nTHS, 12)  area-weighted precip per station
+    prsm_temp: np.ndarray             # (Ny, nTHS, 12)  area-weighted temp per station
+    prsm_temp_ths: np.ndarray         # (Ny, nTHS, 12)  raw THS-grid temp slice
+
+
+def read_prism_temp(
+    base_dir: Path | str,
+    ths: str,
+    hsr: str,
+    wy: int,
+    wy_n: int,
+    iy: int,
+    ny: int,
+    n_ths: int,
+    sta_ndx: np.ndarray,
+    grid_code_p_ths: np.ndarray,
+    comid_ths: np.ndarray,
+    nlcd_ths: np.ndarray,
+    p_in: np.ndarray,
+    afstruct: Dict[str, Any],
+    array_nlcd: np.ndarray | None = None,
+    prsm_prec: np.ndarray | None = None,
+    prsm_temp: np.ndarray | None = None,
+    prsm_temp_ths: np.ndarray | None = None,
+    output_dir: Path | str | None = None,
+) -> PrismTempResult:
+    """Read PRISM temperature, compute area-weighted NLCD land-cover and
+    climate variables for all active stations in the current water year.
+
+    Parameters
+    ----------
+    base_dir:
+        Root directory containing the ``HSR<ths[:2]>00/`` folder tree.
+    ths:
+        THS identifier string (e.g. ``'0101'``).
+    hsr:
+        HSR field name used as key in *afstruct* (e.g. ``'HSR0100'``).
+    wy:
+        Current water year (e.g. 2000).
+    wy_n:
+        Final water year of the analysis period.
+    iy:
+        0-based index of the current water year within the *Ny* dimension.
+    ny:
+        Total number of water years.
+    n_ths:
+        Number of THS catchments.
+    sta_ndx:
+        0-based indices into the THS station array for active stations (shape ``(Ns,)``).
+    grid_code_p_ths:
+        GridCode values for each THS catchment (from PRISM precip file, shape ``(nTHS,)``).
+    comid_ths:
+        ComID values for each THS catchment (shape ``(nTHS,)``).
+    nlcd_ths:
+        Array of NLCD fractions for each THS catchment, shape ``(nTHS, 21)``.
+        Columns follow the order in ``NLCD_COLS``.
+    p_in:
+        Monthly precipitation array for THS catchments, shape ``(nTHS, 12)``.
+    afstruct:
+        Station structure dict: ``afstruct[hsr][iy][sta_ndx]`` → station dict with
+        keys ``SBComID``, ``SBGridCode``, ``SBAreaSqKm``.
+    array_nlcd, prsm_prec, prsm_temp, prsm_temp_ths:
+        Pre-allocated accumulator arrays.  If *None* on first call they are
+        initialised here.
+    output_dir:
+        If provided, ``AFstruct_{hsr}_{wy_n}.pkl`` is written here when
+        *wy == wy_n*.
+
+    Returns
+    -------
+    PrismTempResult
+    """
+    base_dir = Path(base_dir)
+    print(f" Reading Monthly PRISM Temperature Data.")
+
+    # ------------------------------------------------------------------
+    # 1. Read temperature file
+    # ------------------------------------------------------------------
+    temp_file = (
+        base_dir
+        / f"HSR{ths[:2]}00"
+        / "PRISM"
+        / "Temperature"
+        / f"PrismTempAveWY{wy}.dat"
+    )
+    temp_df = pd.read_csv(
+        temp_file,
+        sep=r"\s+",
+        header=None,
+        skiprows=4,
+        names=["GridCodeT"] + [f"TdC_{m}" for m in range(1, 13)],
+    )
+    grid_code_t = temp_df["GridCodeT"].to_numpy(dtype=np.uint32)
+    tdc = temp_df[[f"TdC_{m}" for m in range(1, 13)]].to_numpy(dtype=float)  # (nT, 12)
+
+    # ------------------------------------------------------------------
+    # 2. Initialise accumulator arrays on first call
+    # ------------------------------------------------------------------
+    ns = len(sta_ndx)
+    if array_nlcd is None:
+        array_nlcd = -np.ones((ny, n_ths, 21), dtype=float)
+    if prsm_prec is None:
+        prsm_prec = np.full((ny, n_ths, 12), -9999.0, dtype=float)
+    if prsm_temp is None:
+        prsm_temp = np.full((ny, n_ths, 12), -9999.0, dtype=float)
+    if prsm_temp_ths is None:
+        prsm_temp_ths = np.zeros((ny, n_ths, 12), dtype=float)
+
+    # ------------------------------------------------------------------
+    # 3. Store THS-grid temperature slice
+    #    intersect(GridCodeP_THS, GridCodeT) → matched indices
+    # ------------------------------------------------------------------
+    _, ia, ib = np.intersect1d(grid_code_p_ths, grid_code_t, return_indices=True)
+    prsm_temp_ths[iy, ia, :] = tdc[ib, :]
+
+    # ------------------------------------------------------------------
+    # 4 & 5. Per-station area-weighted NLCD, precip, and temperature
+    # ------------------------------------------------------------------
+    for s_idx in sta_ndx:
+        sta = afstruct[hsr][iy][s_idx]
+        sb_area = np.asarray(sta["SBAreaSqKm"], dtype=float)  # (nSB,)
+
+        # --- NLCD land cover (intersect on ComID) ---
+        _, _, ib_nlcd = np.intersect1d(
+            np.asarray(sta["SBComID"]), comid_ths, return_indices=True
+        )
+        nlcd_sub = nlcd_ths[ib_nlcd, :]                          # (nSB, 21)
+        wt_lu = sb_area[:, np.newaxis] * nlcd_sub                # (nSB, 21)
+        total_area_21 = sb_area.sum()
+        sta["NLCD"] = wt_lu.sum(axis=0) / total_area_21          # (21,)
+
+        # --- Precipitation (intersect on ComID, reuse ib_nlcd) ---
+        p_sub = p_in[ib_nlcd, :12]                               # (nSB, 12)
+        wt_p = sb_area[:, np.newaxis] * p_sub                    # (nSB, 12)
+        total_area_12 = sb_area.sum()
+        sta["Precip"] = wt_p.sum(axis=0) / total_area_12         # (12,)
+        prsm_prec[iy, s_idx, :] = sta["Precip"]
+
+        # --- Temperature (intersect on GridCode) ---
+        _, _, ib_t = np.intersect1d(
+            np.asarray(sta["SBGridCode"]), grid_code_t, return_indices=True
+        )
+        area_t = sb_area[: len(ib_t)]                            # align to matched subset
+        wt_tc = area_t[:, np.newaxis] * tdc[ib_t, :12]          # (nMatch, 12)
+        sta["Temp"] = wt_tc.sum(axis=0) / area_t.sum()           # (12,)
+        prsm_temp[iy, s_idx, :] = sta["Temp"]
+
+        afstruct[hsr][iy][s_idx] = sta
+
+    # ------------------------------------------------------------------
+    # 6. Save AFstruct at end of last water year
+    # ------------------------------------------------------------------
+    if wy == wy_n and output_dir is not None:
+        out_path = Path(output_dir) / f"AFstruct_{hsr}_{wy_n}.pkl"
+        with open(out_path, "wb") as fh:
+            pickle.dump(afstruct, fh)
+        print(f" Saved AFstruct to {out_path}")
+
+    return PrismTempResult(
+        afstruct=afstruct,
+        array_nlcd=array_nlcd,
+        prsm_prec=prsm_prec,
+        prsm_temp=prsm_temp,
+        prsm_temp_ths=prsm_temp_ths,
+    )

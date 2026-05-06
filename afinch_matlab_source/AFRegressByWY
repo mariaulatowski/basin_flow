@@ -1,0 +1,161 @@
+"""
+AFRegressByWY — Python translation of MATLAB AFRegressByWY.
+
+For each water year and month, fit OLS and robust regressions using the
+monthly variable selections determined from the period-of-analysis models.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Sequence
+
+import matplotlib.pyplot as plt
+import numpy as np
+import statsmodels.api as sm
+
+
+@dataclass
+class WYRegressionEntry:
+	RobustB: np.ndarray
+	RobustStats: Any
+	RobustPredRUAdj: np.ndarray
+	b: np.ndarray
+	bint: np.ndarray
+	r: np.ndarray
+	rint: np.ndarray
+	stats: np.ndarray
+	OLSPredRUAdj: np.ndarray
+
+
+def regress_by_wy(
+	reg_mat: np.ndarray,
+	reg_month: Sequence[Any],
+	wy1: int,
+	ny: int,
+	month_name: Sequence[str],
+	figposition: Sequence[float] | None = None,
+	make_plots: bool = True,
+) -> List[List[WYRegressionEntry]]:
+	"""Fit monthly OLS and robust regressions for each water year.
+
+	Parameters
+	----------
+	reg_mat:
+		Regression matrix from AFRegressPOA with columns
+		[WY, Station, Month, YAdjIncWY, explanatory vars...].
+	reg_month:
+		Monthly POA regression objects; each must expose ``inmodel``.
+	wy1:
+		First water year of the analysis period.
+	ny:
+		Number of water years.
+	month_name:
+		12 month labels.
+	figposition:
+		Optional matplotlib figure size/position surrogate. Only width/height are used.
+	make_plots:
+		If True, create the 4x3 measured-vs-estimated subplot figure for each WY.
+	"""
+	reg_hist: List[List[WYRegressionEntry]] = []
+
+	figsize = None
+	if figposition is not None and len(figposition) >= 4:
+		figsize = (max(8.0, figposition[2] / 100.0), max(6.0, figposition[3] / 100.0))
+
+	for iy in range(ny):
+		wy = wy1 + iy
+		ndx_wy = np.flatnonzero(reg_mat[:, 0] == wy)
+		wy_entries: List[WYRegressionEntry] = []
+
+		fig = None
+		axes = None
+		if make_plots:
+			fig, axes = plt.subplots(4, 3, num=60 + iy, clear=True, figsize=figsize)
+			fig.canvas.manager.set_window_title(
+				f"Measured and Estimated Incremental Water Yields at Gaging Stations in WY {wy} "
+				"(red pluses are robust estimates, blue circles are OLS estimates)."
+			)
+			axes = np.asarray(axes).reshape(4, 3)
+
+		for im in range(12):
+			ndx_mo = np.flatnonzero(reg_mat[:, 2] == (im + 1))
+			ndx_obs = np.intersect1d(ndx_wy, ndx_mo)
+			ndx_xvar = np.flatnonzero(np.asarray(reg_month[im].inmodel))
+
+			y = reg_mat[ndx_obs, 3]
+			if ndx_xvar.size > 0:
+				reg_design = reg_mat[ndx_obs[:, None], 4 + ndx_xvar].reshape(len(ndx_obs), len(ndx_xvar))
+			else:
+				reg_design = np.empty((len(ndx_obs), 0), dtype=float)
+
+			reg_design_aug = sm.add_constant(reg_design, has_constant="add")
+
+			# statsmodels builds may not include Fair; fall back to HuberT.
+			robust_norm_cls = getattr(sm.robust.norms, "Fair", sm.robust.norms.HuberT)
+			robust_model = sm.RLM(y, reg_design_aug, M=robust_norm_cls()).fit()
+			robust_b = np.asarray(robust_model.params, dtype=float)
+			robust_pred = reg_design_aug @ robust_b
+
+			ols_model = sm.OLS(y, reg_design_aug).fit()
+			ols_b = np.asarray(ols_model.params, dtype=float)
+			ols_pred = reg_design_aug @ ols_b
+			ols_bint = np.asarray(ols_model.conf_int(), dtype=float)
+			ols_resid = np.asarray(ols_model.resid, dtype=float)
+			ols_rint = np.full((len(ols_resid), 2), np.nan, dtype=float)
+			ols_stats = np.array(
+				[
+					float(ols_model.rsquared),
+					float(ols_model.fvalue) if ols_model.fvalue is not None else np.nan,
+					float(ols_model.f_pvalue) if ols_model.f_pvalue is not None else np.nan,
+					float(ols_model.mse_resid),
+				],
+				dtype=float,
+			)
+
+			entry = WYRegressionEntry(
+				RobustB=robust_b,
+				RobustStats=robust_model,
+				RobustPredRUAdj=np.asarray(robust_pred, dtype=float),
+				b=ols_b,
+				bint=ols_bint,
+				r=ols_resid,
+				rint=ols_rint,
+				stats=ols_stats,
+				OLSPredRUAdj=np.asarray(ols_pred, dtype=float),
+			)
+			wy_entries.append(entry)
+
+			if make_plots and axes is not None:
+				ax = axes[im // 3, im % 3]
+				ax.plot(y, entry.RobustPredRUAdj, "r+", linestyle="None")
+				ax.plot(y, entry.OLSPredRUAdj, "bo", linestyle="None", markersize=4)
+				ax.set_title(f"{month_name[im]} {wy}")
+				if im in (9, 10, 11):
+					ax.set_xlabel("Measured Water Yield")
+				if im in (0, 3, 6, 9):
+					ax.set_ylabel("Estimated Water Yield")
+
+				if len(y) > 1:
+					rob_r = np.corrcoef(y, entry.RobustPredRUAdj)
+					rp2 = float(rob_r[0, 1] ** 2)
+				else:
+					rp2 = np.nan
+
+				xlim = ax.get_xlim()
+				ylim = ax.get_ylim()
+				lo = min(xlim[0], ylim[0]) + 0.1
+				hi = max(xlim[1], ylim[1]) - 0.1
+				ax.plot([lo, hi], [lo, hi], color="k")
+
+				y_lo_lim = ylim[0] + 0.10 * (ylim[1] - ylim[0])
+				x_up_lim = xlim[1] - 0.22 * (xlim[1] - xlim[0])
+				ax.text(x_up_lim, y_lo_lim, f"r_P^2= {rp2:6.4f}", fontsize=8, color="r")
+
+		reg_hist.append(wy_entries)
+
+		if make_plots and fig is not None:
+			fig.tight_layout()
+			plt.show(block=False)
+
+	return reg_hist

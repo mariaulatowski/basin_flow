@@ -1,0 +1,104 @@
+"""
+FKenSen (AFKenSen_v1d) — Python translation.
+
+Computes Kendall's tau, associated p-value, Sen slope estimator, intercept,
+medians, and fitted trend values.
+"""
+
+from __future__ import annotations
+
+from math import erf, sqrt
+from typing import Literal, Tuple
+
+import numpy as np
+
+
+TailType = Literal["ne", "gt", "lt"]
+
+
+def _normal_cdf(z: float) -> float:
+	return 0.5 * (1.0 + erf(z / sqrt(2.0)))
+
+
+def af_ken_sen(
+	time: np.ndarray,
+	data: np.ndarray,
+	mis_ind: float = -9999.0,
+	tail: TailType = "ne",
+) -> Tuple[float, float, float, float, float, float, np.ndarray]:
+	"""Compute Kendall tau and Sen slope trend statistics.
+
+	Parameters
+	----------
+	time:
+		Time vector (e.g., water years), shape ``(n,)``.
+	data:
+		Data vector, shape ``(n,)``.
+	mis_ind:
+		Missing/censored indicator value to exclude from the analysis.
+	tail:
+		Alternative hypothesis.
+		- ``"ne"``: two-sided (not equal)
+		- ``"gt"``: greater than (positive trend)
+		- ``"lt"``: less than (negative trend)
+
+	Returns
+	-------
+	tau, pval, intcpt, med_slope, med_data, med_time, yhat
+	"""
+	t = np.asarray(time, dtype=float).reshape(-1)
+	y = np.asarray(data, dtype=float).reshape(-1)
+	if t.size != y.size:
+		raise ValueError("time and data must have the same length")
+
+	keep = y != mis_ind
+	t = t[keep]
+	y = y[keep]
+	n = t.size
+	if n < 2:
+		yhat = np.full_like(np.asarray(time, dtype=float).reshape(-1), np.nan)
+		return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, yhat
+
+	s = 0
+	slopes = []
+	for i in range(n - 1):
+		dt = t[i + 1 :] - t[i]
+		dy = y[i + 1 :] - y[i]
+		s += int(np.sum(np.sign(dy)))
+		valid = dt != 0
+		if np.any(valid):
+			slopes.extend((dy[valid] / dt[valid]).tolist())
+
+	tau = 2.0 * s / (n * (n - 1))
+
+	# Asymptotic variance without tie correction, consistent with common MK form.
+	var_s = n * (n - 1) * (2 * n + 5) / 18.0
+	if var_s <= 0:
+		pval = np.nan
+	else:
+		if s > 0:
+			z = (s - 1.0) / sqrt(var_s)
+		elif s < 0:
+			z = (s + 1.0) / sqrt(var_s)
+		else:
+			z = 0.0
+
+		if tail == "ne":
+			pval = 2.0 * (1.0 - _normal_cdf(abs(z)))
+		elif tail == "gt":
+			pval = 1.0 - _normal_cdf(z)
+		elif tail == "lt":
+			pval = _normal_cdf(z)
+		else:
+			raise ValueError("tail must be one of: 'ne', 'gt', 'lt'")
+
+	med_slope = float(np.median(slopes)) if slopes else 0.0
+	intcpt = float(np.median(y - med_slope * t))
+	med_data = float(np.median(y))
+	med_time = float(np.median(t))
+
+	# Return fitted values on original time vector.
+	t_full = np.asarray(time, dtype=float).reshape(-1)
+	yhat = intcpt + med_slope * t_full
+
+	return tau, float(pval), intcpt, med_slope, med_data, med_time, yhat

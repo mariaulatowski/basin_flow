@@ -1,0 +1,156 @@
+"""
+AFPlotAreasFlows
+
+Python translation of MATLAB logic to:
+1. Plot NHD vs NWIS incremental drainage area diagnostics.
+2. Compute adjusted total flows and incremental flows at active gages.
+3. Persist incremental flows into AFstruct and StaHist records.
+4. Plot monthly sqrt(flow) vs sqrt(area) diagnostics in a 4x3 panel.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+
+@dataclass
+class PlotAreasFlowsResult:
+	afstruct: dict
+	sta_hist: dict
+	q_adj_wy: np.ndarray
+	q_tot_inc_wy: np.ndarray
+	q_adj_inc_wy: np.ndarray
+
+
+def _stack_station_water_use(afstruct: dict, hsr: str, iy: int, sta_ndx: np.ndarray) -> np.ndarray:
+	"""Stack station WaterUse vectors to shape (Ns, 12)."""
+	rows = []
+	for sidx in sta_ndx:
+		wu = np.asarray(afstruct[hsr][iy][int(sidx)].get("WaterUse", np.zeros(12, dtype=float)), dtype=float)
+		if wu.shape[0] != 12:
+			raise ValueError(f"Station index {sidx} WaterUse must have 12 monthly values")
+		rows.append(wu)
+	return np.vstack(rows) if rows else np.zeros((0, 12), dtype=float)
+
+
+def plot_areas_flows(
+	afstruct: dict,
+	sta_hist: dict,
+	hsr: str,
+	iy: int,
+	wy: int,
+	net_design: np.ndarray,
+	q_tot_wy: np.ndarray,
+	nhd_area_iwy: np.ndarray,
+	nwis_area_iwy: np.ndarray,
+	month_names: list[str],
+	figposition: tuple[int, int, int, int] | None = None,
+	make_plots: bool = True,
+) -> PlotAreasFlowsResult:
+	"""
+	Execute AFPlotAreasFlows behavior for a single water year.
+
+	Parameters
+	----------
+	afstruct, sta_hist, hsr, iy
+		Shared analysis structures from prior steps.
+	wy
+		Current water year.
+	net_design
+		Network design matrix (Ns x Ns).
+	q_tot_wy
+		Total measured flows at active stations, shape (Ns, 13).
+	nhd_area_iwy, nwis_area_iwy
+		Incremental basin areas at active stations.
+	month_names
+		Ordered month names (12 water-year months).
+	figposition
+		Optional figure geometry (x, y, width, height) for panel plot.
+	make_plots
+		Set False to compute without plotting.
+	"""
+	print("AFPlotAreasFlows: Computing Incremental Areas and Flows.")
+
+	sta_ndx = np.asarray(sta_hist[iy].sta_ndx, dtype=int)
+	ns = int(sta_hist[iy].n_sta_act)
+	if q_tot_wy.shape[1] < 13:
+		raise ValueError("q_tot_wy must have 13 columns (12 months + annual)")
+
+	water_use = _stack_station_water_use(afstruct, hsr, iy, sta_ndx)
+
+	# MATLAB:
+	# QAdjWY(:,1:12) = WaterUse + QTotWY(:,1:12)
+	# QAdjWY(:,13) = mean(WaterUse,2) + QTotWY(:,13)
+	q_adj_wy = np.zeros_like(q_tot_wy, dtype=float)
+	q_adj_wy[:, :12] = q_tot_wy[:, :12] + water_use
+	q_adj_wy[:, 12] = q_tot_wy[:, 12] + water_use.mean(axis=1)
+
+	# Incremental flows via NetDesign solve.
+	q_tot_inc_wy = np.linalg.solve(net_design, q_tot_wy)
+	q_adj_inc_wy = np.linalg.solve(net_design, q_adj_wy)
+
+	# Persist to AFstruct station records.
+	for is_local in range(ns):
+		sidx = int(sta_ndx[is_local])
+		afstruct[hsr][iy][sidx]["QMeaTotInc"] = q_tot_inc_wy[is_local, :]
+		afstruct[hsr][iy][sidx]["QMeaAdjInc"] = q_adj_inc_wy[is_local, :]
+
+	# Persist to StaHist.
+	sta_hist[iy].q_tot_wy = q_tot_wy
+	sta_hist[iy].q_adj_wy = q_adj_wy
+	sta_hist[iy].q_tot_inc_wy = q_tot_inc_wy
+	sta_hist[iy].q_adj_inc_wy = q_adj_inc_wy
+
+	if make_plots:
+		import matplotlib.pyplot as plt
+
+		# Figure 7: area comparison.
+		fig7 = plt.figure(7)
+		fig7.clf()
+		ax7 = fig7.add_subplot(1, 1, 1)
+		ax7.plot(np.sqrt(nhd_area_iwy), np.sqrt(nwis_area_iwy), "r*")
+		ax7.set_xlabel("NHD INCREMENTAL AREAS AT GAGES, IN SQRT(SQMI)")
+		ax7.set_ylabel("NWIS INCREMENTAL AREAS AT GAGES, IN SQRT(SQMI)")
+		max_area = float(max(np.max(nhd_area_iwy), np.max(nwis_area_iwy))) if ns > 0 else 1.0
+		ax7.plot([0.1, np.sqrt(max_area)], [0.1, np.sqrt(max_area)], "k-")
+		ax7.set_aspect("equal", adjustable="box")
+		ax7.set_title(f"Incremental Areas at Gaging Stations for Water Year {wy}")
+
+		# Figure 9: monthly incremental flow diagnostics.
+		fig9 = plt.figure(9)
+		fig9.clf()
+		if figposition is not None and len(figposition) == 4:
+			_, _, w, h = figposition
+			# Matplotlib uses inches; keep relative scaling from pixel-like inputs.
+			fig9.set_size_inches(max(w, 1) / 100.0, max(h, 1) / 100.0)
+
+		for im in range(12):
+			ax = fig9.add_subplot(4, 3, im + 1)
+			ndx_ge0 = np.where(q_tot_inc_wy[:, im] >= 0)[0]
+			if ndx_ge0.size > 0:
+				ax.plot(np.sqrt(nhd_area_iwy[ndx_ge0]), np.sqrt(q_tot_inc_wy[ndx_ge0, im]), "r+")
+				ax.plot(np.sqrt(nhd_area_iwy[ndx_ge0]), np.sqrt(q_adj_inc_wy[ndx_ge0, im]), "bo")
+			ax.set_title(f"{month_names[im]} {wy}")
+			if im + 1 in (1, 4, 7, 10):
+				ax.set_ylabel("Sqrt Flow, in ft^3/s")
+			if im + 1 in (10, 11, 12):
+				ax.set_xlabel("Sqrt Drainage Area, in mi^2")
+
+		fig9.suptitle(f"Incremental Monthly Flows and Incremental Drainage NHD Areas at Gaging Stations in WY {wy}")
+		fig9.tight_layout()
+		plt.show()
+
+	return PlotAreasFlowsResult(
+		afstruct=afstruct,
+		sta_hist=sta_hist,
+		q_adj_wy=q_adj_wy,
+		q_tot_inc_wy=q_tot_inc_wy,
+		q_adj_inc_wy=q_adj_inc_wy,
+	)
+
+
+if __name__ == "__main__":
+	# Placeholder only.
+	_ = None

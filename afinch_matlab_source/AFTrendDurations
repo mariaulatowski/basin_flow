@@ -1,0 +1,329 @@
+"""
+AFTrendDurations — Python translation of MATLAB AFTrendDurations.
+
+Computes monthly flow-duration characteristics and trend overlays for a
+target ComID using constrained accumulated monthly flows.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Sequence
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+
+MONTH_ABBREV = ["Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep"]
+MO_NUMBER = [10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+
+@dataclass
+class TrendDurationResult:
+	fdc: np.ndarray
+	qm: np.ndarray
+	ranks: np.ndarray
+	trend_stats: list[dict[str, float]]
+	station_target: str | None
+
+
+def _normal_cdf(x: float) -> float:
+	return float(0.5 * (1.0 + np.math.erf(x / np.sqrt(2.0))))
+
+
+def _kendall_sen(time: np.ndarray, flow: np.ndarray, censor_value: float = -9999.0) -> tuple[float, float, float, float, float, float, np.ndarray]:
+	mask = flow != censor_value
+	x = np.asarray(time[mask], dtype=float)
+	y = np.asarray(flow[mask], dtype=float)
+	n = len(x)
+	if n < 2:
+		yhat = np.full_like(time, np.nan, dtype=float)
+		return np.nan, np.nan, np.nan, 0.0, np.nan, np.nan, yhat
+
+	s = 0
+	slopes = []
+	for i in range(n - 1):
+		dx = x[i + 1 :] - x[i]
+		dy = y[i + 1 :] - y[i]
+		s += int(np.sum(np.sign(dy)))
+		valid = dx != 0
+		slopes.extend((dy[valid] / dx[valid]).tolist())
+
+	tau = 2.0 * s / (n * (n - 1))
+	var_s = n * (n - 1) * (2 * n + 5) / 18.0
+	if var_s <= 0:
+		pval = np.nan
+	else:
+		if s > 0:
+			z = (s - 1.0) / np.sqrt(var_s)
+		elif s < 0:
+			z = (s + 1.0) / np.sqrt(var_s)
+		else:
+			z = 0.0
+		pval = 2.0 * (1.0 - _normal_cdf(abs(z)))
+
+	med_slope = float(np.median(slopes)) if slopes else 0.0
+	intcpt = float(np.median(y - med_slope * x))
+	med_data = float(np.median(y))
+	med_time = float(np.median(x))
+	yhat = intcpt + med_slope * np.asarray(time, dtype=float)
+	return tau, pval, intcpt, med_slope, med_data, med_time, yhat
+
+
+def _double_exp_smooth(series: np.ndarray, a1: float, g1: float) -> np.ndarray:
+	n = len(series)
+	if n == 0:
+		return np.array([], dtype=float)
+	s = np.zeros(n, dtype=float)
+	b = np.zeros(n, dtype=float)
+	seed_len = min(5, n)
+	s[0] = float(np.median(series[:seed_len]))
+	b[0] = float((series[0] - series[-1]) / max(1, n))
+	for i in range(1, n):
+		s[i] = a1 * series[i] + (1 - a1) * (s[i - 1] - b[i - 1])
+		b[i] = g1 * (s[i] - s[i - 1]) + (1 - g1) * b[i - 1]
+	return s
+
+
+def trend_durations(
+	base_dir: Path | str,
+	hsr: str,
+	comid_target: int,
+	wy1: int,
+	ny: int,
+	month_name: Sequence[str],
+	mo_name: Sequence[str],
+	hr_comid: np.ndarray,
+	hr_sta_num: np.ndarray,
+	sta_hist: Sequence[Dict[str, Any]],
+	alpha: float = 0.025,
+	a1: float = 0.10,
+	g1: float = 0.10,
+	method: str = "Moving Average",
+	write_output: bool = False,
+	output_file: Path | str | None = None,
+	make_plots: bool = True,
+) -> TrendDurationResult:
+	"""Compute flow-duration and trend characteristics for one ComID."""
+	base = Path(base_dir)
+	fdc = np.zeros((ny, 12), dtype=float)
+
+	trend_duration_matrix = []
+	for iy in range(ny):
+		f = base / hsr / "Output" / "FlowAccum" / f"ComIDQ12WY{wy1 + iy}.csv"
+		trend_duration_matrix.append(pd.read_csv(f))
+
+	for iy in range(ny):
+		df = trend_duration_matrix[iy]
+		rows = df[df.iloc[:, 0] == comid_target]
+		if rows.empty:
+			raise ValueError(f"Requested ComID {comid_target} was not found.")
+		fdc[iy, :] = rows.iloc[0, 1:13].to_numpy(dtype=float)
+		print(f"Reading accumulated monthly flows for WY{wy1 + iy:4d}.")
+
+	# Optional measured gage flow at target ComID
+	qm = np.zeros((ny, 13), dtype=float)
+	station_target = None
+	ndx_comid = np.flatnonzero(hr_comid == comid_target)
+	flag_station = False
+	if len(ndx_comid) > 0:
+		station_target = f"0{int(hr_sta_num[ndx_comid[0]])}"
+		for iy in range(ny):
+			sta_list = sta_hist[iy]["StaList"]
+			ndx_sta = [i for i, s in enumerate(sta_list) if str(s) == station_target]
+			if ndx_sta:
+				flag_station = True
+				qm[iy, 0:12] = np.asarray(sta_hist[iy]["QTotWY"], dtype=float)[ndx_sta[0], 0:12]
+				qm[iy, 12] = 1.0
+
+	ndx_mea = np.flatnonzero(qm[:, 12] == 1.0)
+	print("Finished reading monthly flow data.\n")
+
+	# Duration ranks and exceedance probabilities by month
+	ranks = np.zeros_like(fdc, dtype=float)
+	probs = np.zeros_like(fdc, dtype=float)
+	ndx_nonzero_qe: list[np.ndarray] = []
+	ndx_zero_qe: list[np.ndarray] = []
+	est_zero_q: list[np.ndarray] = []
+	ndx_nonzero_qm: list[np.ndarray] = []
+
+	for im in range(12):
+		q = fdc[:, im]
+		nonz = np.flatnonzero(q > 0)
+		z = np.flatnonzero(q <= 0)
+		ndx_nonzero_qe.append(nonz)
+		ndx_zero_qe.append(z)
+		if len(nonz) > 0:
+			ord_idx = np.argsort(-q[nonz])
+			local_rank = np.empty(len(nonz), dtype=float)
+			local_rank[ord_idx] = np.arange(1, len(nonz) + 1)
+			ranks[nonz, im] = local_rank
+			probs[nonz, im] = 100.0 * local_rank / (len(nonz) + 1)
+			est_zero_q.append(np.maximum(0.01, np.min(q[nonz]) * 0.5) * np.ones(len(z)))
+		else:
+			est_zero_q.append(np.zeros(len(z), dtype=float))
+		if len(ndx_mea) > 0:
+			ndx_nonzero_qm.append(np.flatnonzero(qm[:, im] > 0))
+		else:
+			ndx_nonzero_qm.append(np.array([], dtype=int))
+
+	trend_stats: list[dict[str, float]] = []
+	years = wy1 + np.arange(ny)
+
+	if make_plots:
+		fig20, ax20 = plt.subplots(4, 3, num=20, clear=True, figsize=(13, 10))
+		ax20 = np.asarray(ax20).reshape(4, 3)
+		if flag_station and station_target is not None:
+			fig20.canvas.manager.set_window_title(
+				f"Monthly Flow Duration Curves for ComID {comid_target} in {hsr} at gaging station {station_target}"
+			)
+			fig_label = (
+				f"Monthly Flow Duration Curves for ComID {comid_target} in {hsr} at gaging station {station_target} "
+				f"from WY{wy1} to WY{wy1 + ny - 1}"
+			)
+		else:
+			fig20.canvas.manager.set_window_title(f"Monthly Flow Duration Curves for ComID {comid_target} in {hsr}")
+			fig_label = f"Monthly Flow Duration Curves for ComID {comid_target} in {hsr} from WY{wy1} to WY{wy1 + ny - 1}"
+
+		for im in range(12):
+			ax = ax20[im // 3, im % 3]
+			nz = ndx_nonzero_qe[im]
+			if len(nz) > 0:
+				p = probs[nz, im]
+				q = fdc[nz, im]
+				ord_idx = np.argsort(p)
+				ax.semilogy(p[ord_idx], q[ord_idx], "ko", markersize=4)
+			ax.set_xlim(0, 100)
+			qpos = fdc[fdc[:, im] > 0, im]
+			ymin = max(0.01, float(np.min(qpos)) if len(qpos) > 0 else 0.01)
+			ymax = float(np.max(qpos)) if len(qpos) > 0 else 10.0
+			ax.set_ylim(10 ** np.floor(np.log10(ymin)), 10 ** np.ceil(np.log10(max(ymax, ymin))))
+			ax.set_title(month_name[im], fontsize=10, fontweight="bold")
+			if im == 10:
+				ax.set_xlabel("Percentage of time indicated value was equalled or exceeded")
+			if im in (0, 6):
+				ax.set_ylabel("Streamflow, in cubic feet per second")
+			if im == 0:
+				ax.text(5, ax.get_ylim()[1] * 1.1, fig_label, fontweight="bold")
+
+		fig20.tight_layout()
+
+		fig21, ax21 = plt.subplots(4, 3, num=21, clear=True, figsize=(13, 10))
+		ax21 = np.asarray(ax21).reshape(4, 3)
+		if flag_station and station_target is not None:
+			fig21.canvas.manager.set_window_title(
+				f"Trends in Monthly Flows for ComID {comid_target} in {hsr} at gaging station {station_target}"
+			)
+			ts_label = (
+				f"Monthly Time Series for ComID {comid_target} in {hsr} at gaging station {station_target} "
+				f"from WY{wy1} to WY{wy1 + ny - 1}"
+			)
+		else:
+			fig21.canvas.manager.set_window_title(f"Trends in Monthly Flows for ComID {comid_target} in {hsr}")
+			ts_label = f"Monthly Time Series for ComID {comid_target} in {hsr} from WY{wy1} to WY{wy1 + ny - 1}"
+
+	for im in range(12):
+		qvec = np.concatenate([
+			fdc[ndx_nonzero_qe[im], im],
+			-9999.0 * np.ones(len(ndx_zero_qe[im]), dtype=float),
+		])
+		tvec = np.concatenate([
+			years[ndx_nonzero_qe[im]],
+			years[ndx_zero_qe[im]],
+		])
+		tau, pval, intcpt, med_slope, med_data, med_time, yhat = _kendall_sen(tvec, qvec, -9999.0)
+		trend_stats.append(
+			{
+				"tau": tau,
+				"pval": pval,
+				"intercept": intcpt,
+				"median_slope": med_slope,
+				"median_data": med_data,
+				"median_time": med_time,
+			}
+		)
+
+		if make_plots:
+			ax = ax21[im // 3, im % 3]
+			nz = ndx_nonzero_qe[im]
+			if len(nz) > 0:
+				ax.semilogy(years[nz], fdc[nz, im], "o", markersize=4, markerfacecolor="k", markeredgecolor="k")
+			zz = ndx_zero_qe[im]
+			if len(zz) > 0:
+				minz = float(np.min(est_zero_q[im])) if len(est_zero_q[im]) > 0 else 0.01
+				maxz = float(np.max(est_zero_q[im])) if len(est_zero_q[im]) > 0 else 0.1
+				for zndx in zz:
+					ax.semilogy([years[zndx], years[zndx]], [minz, maxz], "k:")
+
+			if len(ndx_mea) > 0 and len(ndx_nonzero_qm[im]) > 0:
+				nqm = ndx_nonzero_qm[im]
+				ax.semilogy(years[nqm], np.maximum(qm[nqm, im], 0.2), "o", markersize=4, markerfacecolor="r", markeredgecolor="k")
+
+			qpos = fdc[fdc[:, im] > 0, im]
+			ymin = max(0.01, float(np.min(qpos)) if len(qpos) > 0 else 0.01)
+			ymax = float(np.max(qpos)) if len(qpos) > 0 else 10.0
+			ax.set_xlim(wy1 - 1, wy1 + ny)
+			ax.set_ylim(10 ** np.floor(np.log10(ymin)), 10 ** np.ceil(np.log10(max(ymax, ymin))))
+			ax.set_title(month_name[im], fontsize=10, fontweight="bold")
+			if im in (0, 6):
+				ax.set_ylabel("Streamflow, in cubic feet per second")
+			if im in (9, 10, 11):
+				ax.set_xlabel("Water Year")
+			if im == 0:
+				ax.text(wy1, ax.get_ylim()[1] * 1.1, ts_label, fontweight="bold")
+
+			if pval < alpha:
+				print("Month tau p-value intercept median_slope median_data median_time")
+				print(
+					f"{mo_name[im]:>5s} {tau:7.5f} {pval:7.4f} {intcpt:12.4f} {med_slope:11.4f} {med_data:14.4f} {med_time:12.2f}"
+				)
+				if method == "Linear":
+					xline = np.array([wy1 - 1, wy1 + ny], dtype=float)
+					yline = intcpt + med_slope * xline
+					ax.semilogy(xline, np.maximum(yline, 1e-6), "r-", linewidth=1.5)
+				else:
+					s = _double_exp_smooth(np.maximum(fdc[:, im], 1e-6), a1, g1)
+					ax.semilogy(years, s, "r-", linewidth=1.5)
+			else:
+				if method == "Linear":
+					med = float(np.median(np.maximum(fdc[:, im], 1e-6)))
+					ax.semilogy(np.array([wy1 - 1, wy1 + ny]), np.array([med, med]), "b:", linewidth=1.5)
+				else:
+					s = np.zeros(ny, dtype=float)
+					seed_len = min(5, ny)
+					s[0] = float(np.median(np.maximum(fdc[:seed_len, im], 1e-6)))
+					for i in range(1, ny):
+						s[i] = a1 * max(fdc[i - 1, im], 1e-6) + (1 - a1) * s[i - 1]
+					ax.semilogy(years, s, "b:", linewidth=1.5)
+
+	if make_plots:
+		fig21.tight_layout()
+		plt.show(block=False)
+
+	if write_output:
+		if output_file is None:
+			out_dir = base / f"HSR{hsr[-4:]}" / "Output" / "FlowSeries"
+			out_dir.mkdir(parents=True, exist_ok=True)
+			output_file = out_dir / f"ComID{comid_target}.dat"
+		output_file = Path(output_file)
+		with output_file.open("w", encoding="utf-8") as fh:
+			fh.write(" Month Flow \n")
+			fh.write("Year Number Name ft3/s Rank \n")
+			for i in range(ny):
+				for j in range(12):
+					fh.write(
+						f"{wy1 + i:4.0f} {MO_NUMBER[j]:5.0f} {mo_name[j]:>6s} {fdc[i, j]:8.2f} {ranks[i, j]:7.2f} \n"
+					)
+		print(f"File {output_file} written.")
+	else:
+		print("Time series not written to file.")
+
+	return TrendDurationResult(
+		fdc=fdc,
+		qm=qm,
+		ranks=ranks,
+		trend_stats=trend_stats,
+		station_target=station_target,
+	)

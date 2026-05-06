@@ -1,0 +1,209 @@
+"""
+AFStaBasinGridComIDWY
+
+Python translation of MATLAB logic to:
+1. Build/append StaHist for the current WY index
+2. Copy station basin members to mutable subbasin fields
+3. Aggregate water-use by active station basin
+4. Build nested-basin Network Design matrix
+5. Compute incremental NWIS and NHD areas
+6. Export StaBasinGridComIDWY{WY}.dat
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+
+SQKM_TO_SQMI = 0.3861
+
+
+@dataclass
+class StaHistEntry:
+	sta_list: list[str]
+	sta_ndx: np.ndarray
+	n_sta_act: int
+	q_tot_wy: np.ndarray
+	q_adj_wy: np.ndarray | None = None
+	q_tot_inc_wy: np.ndarray | None = None
+	q_adj_inc_wy: np.ndarray | None = None
+	nwis_area_iwy: np.ndarray | None = None
+	nhd_area_iwy: np.ndarray | None = None
+
+
+@dataclass
+class StaBasinResult:
+	afstruct: dict
+	sta_hist: dict[int, StaHistEntry]
+	net_design: np.ndarray
+	sta_list: list[str]
+	sta_ndx: np.ndarray
+	flo_ndx: np.ndarray
+
+
+def _intersect_with_indices(a: list[str], b: list[str]) -> tuple[list[str], np.ndarray, np.ndarray]:
+	b_lookup = {v: i for i, v in enumerate(b)}
+	common = []
+	ia = []
+	ib = []
+	for i, v in enumerate(a):
+		if v in b_lookup:
+			common.append(v)
+			ia.append(i)
+			ib.append(b_lookup[v])
+	return common, np.asarray(ia, dtype=int), np.asarray(ib, dtype=int)
+
+
+def _get_station_record(afstruct: dict, hsr: str, iy: int, sta_idx_1based: int) -> dict:
+	return afstruct[hsr][iy][sta_idx_1based]
+
+
+def sta_basin_grid_comid_wy(
+	afstruct: dict,
+	hsr: str,
+	ths: str,
+	wy: int,
+	iy: int,
+	sta_wy: list[str],
+	q: np.ndarray,
+	nwis_area: np.ndarray,
+	comid_wu: np.ndarray,
+	comid_ths: np.ndarray,
+	reach_wu: np.ndarray,
+	output_dir: Path,
+	sta_hist: dict[int, StaHistEntry] | None = None,
+	plot_matrix: bool = False,
+) -> StaBasinResult:
+	"""
+	Execute AFStaBasinGridComIDWY logic for one water-year index.
+
+	Notes
+	-----
+	- afstruct format expected from prior conversion:
+	  afstruct[hsr][iy][station_index_1based] -> station record dict.
+	- q is expected shape (N_station_wy, 13) matching StaWY order.
+	- nwis_area is expected shape (N_station_wy,).
+	"""
+	print("AFStaBasinGridComIDWY: Creating/populating StaHist structure, determining annual Network Design Matrix.")
+
+	# Active station intersection between AFstruct station list and current WY station list.
+	all_station_indices = sorted(afstruct[hsr][iy].keys())
+	station_all = [str(_get_station_record(afstruct, hsr, iy, s)["Station"]) for s in all_station_indices]
+	sta_list, sta_ndx_0, flo_ndx = _intersect_with_indices(station_all, [str(x) for x in sta_wy])
+	ns = len(sta_list)
+
+	# Convert back to original 1-based station indices used by afstruct.
+	sta_ndx = np.asarray([all_station_indices[i] for i in sta_ndx_0], dtype=int)
+
+	if sta_hist is None:
+		sta_hist = {}
+
+	q_tot_wy = q[flo_ndx, :]
+	sta_hist[iy] = StaHistEntry(
+		sta_list=sta_list,
+		sta_ndx=sta_ndx,
+		n_sta_act=ns,
+		q_tot_wy=q_tot_wy,
+	)
+
+	comid_wu = np.asarray(comid_wu, dtype=np.int64)
+	comid_ths = np.asarray(comid_ths, dtype=np.int64)
+
+	# Populate mutable subbasin arrays and station water-use aggregation.
+	for is_local in range(ns):
+		sidx = int(sta_ndx[is_local])
+		rec = _get_station_record(afstruct, hsr, iy, sidx)
+		print(f"{is_local + 1:5d} {sidx:5d} {rec['Station']}")
+
+		rec["SBGridCode"] = np.asarray(rec["GridCode"]).copy()
+		rec["SBComID"] = np.asarray(rec["ComID"]).copy()
+		rec["SBAreaSqKm"] = np.asarray(rec["AreaSqKm"]).copy()
+		rec["SBReachCode"] = np.asarray(rec["ReachCode"]).copy()
+
+		# Intersect station ComIDs with water-use ComIDs.
+		station_comid = np.asarray(rec["ComID"], dtype=np.int64)
+		comidwu = np.intersect1d(station_comid, comid_wu)
+		if comidwu.size > 0:
+			print(f" Number of reaches with specified WU {comidwu.size}")
+			# Map matched ComIDs into THS reach order, then sum ReachWU rows by month.
+			ndxb = np.where(np.isin(comid_ths, comidwu))[0]
+			rec["WaterUse"] = reach_wu[ndxb, :].sum(axis=0)
+
+	# Define Network Design Matrix as identity then mark nested basins.
+	net_design = np.eye(ns, dtype=float)
+	for is_local in range(ns - 1):
+		is_idx = int(sta_ndx[is_local])
+		rec_i = _get_station_record(afstruct, hsr, iy, is_idx)
+		for js_local in range(is_local + 1, ns):
+			js_idx = int(sta_ndx[js_local])
+			rec_j = _get_station_record(afstruct, hsr, iy, js_idx)
+
+			gc_i = np.asarray(rec_i["SBGridCode"])
+			gc_j = np.asarray(rec_j["SBGridCode"])
+			common = np.intersect1d(gc_i, gc_j)
+
+			if common.size > 0:
+				net_design[js_local, is_local] = 1.0
+
+				# Remove overlap from downstream/lower basin (MATLAB setxor behavior).
+				unique_j = np.setxor1d(gc_j, gc_i)
+				keep_mask = np.isin(gc_j, unique_j)
+				rec_j["SBGridCode"] = np.asarray(rec_j["SBGridCode"])[keep_mask]
+				rec_j["SBComID"] = np.asarray(rec_j["SBComID"])[keep_mask]
+				rec_j["SBAreaSqKm"] = np.asarray(rec_j["SBAreaSqKm"])[keep_mask]
+				rec_j["SBReachCode"] = np.asarray(rec_j["SBReachCode"])[keep_mask]
+
+	# Optional plot of NetDesign matrix.
+	if plot_matrix:
+		import matplotlib.pyplot as plt
+
+		plt.figure(figsize=(6, 6))
+		plt.imshow(net_design, vmin=0, vmax=1, interpolation="nearest", cmap="Greys")
+		plt.title(f"Network Matrix Configuration {wy} for {ths}")
+		plt.ylabel("ORDERED USGS GAGING STATION NUMBER")
+		plt.xlabel("SEQUENCE NUMBER OF THE ACTIVE GAGING STATION")
+		plt.yticks(np.arange(ns), sta_list)
+		plt.grid(True, which="both", axis="x", alpha=0.25)
+		plt.tight_layout()
+		plt.show()
+
+	# Compute incremental areas using NetDesign solve.
+	nwis_area_iwy = np.linalg.solve(net_design, np.asarray(nwis_area, dtype=float)[flo_ndx])
+	nhd_tot_area = np.asarray([
+		float(_get_station_record(afstruct, hsr, iy, int(sidx))["TotAreaSqMi"]) for sidx in sta_ndx
+	])
+	nhd_area_iwy = np.linalg.solve(net_design, nhd_tot_area)
+	sta_hist[iy].nwis_area_iwy = nwis_area_iwy
+	sta_hist[iy].nhd_area_iwy = nhd_area_iwy
+
+	# Print out GridCodes and ComIDs for each subbasin in WY.
+	output_dir.mkdir(parents=True, exist_ok=True)
+	out_file = output_dir / f"StaBasinGridComIDWY{wy}.dat"
+	with out_file.open("w", encoding="utf-8") as fid:
+		for is_local in range(ns):
+			sidx = int(sta_ndx[is_local])
+			rec = _get_station_record(afstruct, hsr, iy, sidx)
+			nrec = len(rec["SBGridCode"])
+			for r in range(nrec):
+				fid.write(
+					f"{wy:4.0f} {is_local + 1:3d} {sta_list[is_local]} {r + 1:4d} "
+					f"{int(rec['SBGridCode'][r]):8d} {int(rec['SBComID'][r]):9d} "
+					f"{SQKM_TO_SQMI * float(rec['SBAreaSqKm'][r]):7.3f}\n"
+				)
+
+	return StaBasinResult(
+		afstruct=afstruct,
+		sta_hist=sta_hist,
+		net_design=net_design,
+		sta_list=sta_list,
+		sta_ndx=sta_ndx,
+		flo_ndx=flo_ndx,
+	)
+
+
+if __name__ == "__main__":
+	# Placeholder only.
+	_ = None
