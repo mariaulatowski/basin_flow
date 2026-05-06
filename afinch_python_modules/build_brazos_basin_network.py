@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import csv
+from io import StringIO
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rasterio
+import requests
 
 try:
     from build_brazos_hu4_1205_network import (
@@ -167,6 +170,45 @@ def _monthly_acft_to_cfs(acft: float, year: int, month: int) -> float:
     return float(acft) * 43560.0 / secs
 
 
+def _fetch_usgs_drainage_areas(stations: list[str]) -> dict[str, float]:
+    station_ids = sorted({_norm_station_id(s) for s in stations if str(s).strip()})
+    if not station_ids:
+        return {}
+
+    url = "https://waterservices.usgs.gov/nwis/site/"
+    drain_map: dict[str, float] = {}
+
+    for i in range(0, len(station_ids), 25):
+        batch = station_ids[i:i + 25]
+        params = {
+            "format": "rdb",
+            "sites": ",".join(s.zfill(8) for s in batch),
+            "siteOutput": "expanded",
+            "siteStatus": "all",
+        }
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        lines = response.text.splitlines()
+        header_idx = next((idx for idx, line in enumerate(lines) if line.startswith("agency_cd\t")), None)
+        if header_idx is None:
+            continue
+
+        data_lines = [line for line in lines[header_idx:] if line and not line.startswith("#")]
+        reader = csv.DictReader(StringIO("\n".join(data_lines)), delimiter="\t")
+        next(reader, None)
+        for row in reader:
+            site_no = _norm_station_id(str(row.get("site_no", "")).strip())
+            drain_area = str(row.get("drain_area_va", "")).strip()
+            if not site_no or not drain_area:
+                continue
+            try:
+                drain_map[site_no] = float(drain_area)
+            except ValueError:
+                continue
+
+    return drain_map
+
+
 def _build_streamflow_dat_from_gages_csv(
     base_dir: Path,
     wy: int,
@@ -214,6 +256,42 @@ def _build_streamflow_dat_from_gages_csv(
         return pd.DataFrame()
     src = src.drop_duplicates(subset=["StationN"], keep="first")
 
+    area_col = next(
+        (
+            c for c in src.columns
+            if str(c).strip().lower() in {
+                "dasqmi",
+                "drain_area_va",
+                "drainage_area",
+                "drainage_area_sqmi",
+                "nwisarea",
+                "area_sqmi",
+            }
+        ),
+        None,
+    )
+
+    area_map: dict[str, float] = {}
+    if area_col is not None:
+        area_series = pd.to_numeric(src[area_col], errors="coerce")
+        area_map = {
+            station: float(area)
+            for station, area in zip(src["StationN"], area_series)
+            if pd.notna(area) and float(area) > 0
+        }
+
+    missing_for_api = sorted({s for s in src["StationN"].tolist() if s not in area_map})
+    if missing_for_api:
+        try:
+            fetched_map = _fetch_usgs_drainage_areas(missing_for_api)
+            area_map.update(fetched_map)
+            print(
+                f"Fetched USGS drainage area for {len(fetched_map):,} of {len(missing_for_api):,} stations "
+                f"from NWIS site metadata."
+            )
+        except Exception as exc:
+            print(f"WARNING: USGS drainage-area lookup failed; falling back where needed. {exc}")
+
     sm = station_map.copy()
     sm["StationN"] = sm["Station"].map(_norm_station_id)
     sm = sm.drop_duplicates(subset=["StationN"], keep="first")
@@ -238,7 +316,7 @@ def _build_streamflow_dat_from_gages_csv(
         rows.append([
             int(pd.to_numeric(r["ComID"], errors="coerce")),
             str(r["StationN"]),
-            5.79,
+            float(area_map.get(str(r["StationN"]), 5.79)),
             *vals,
             q13,
         ])
