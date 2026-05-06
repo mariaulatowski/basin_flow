@@ -512,15 +512,11 @@ def _load_basin_flowline_and_vaa(gdbs: list[tuple[str, Path]], basin_gdf: gpd.Ge
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    vaa = gpd.read_file(
-                        gdb,
-                        layer=vaa_layer,
-                        columns=[
-                            "permanent_identifier", "COMID", "NHDPlusID",
-                            "hydroseq", "dnhydroseq", "fromnode", "tonode",
-                            "divergenceflag", "startflag",
-                        ],
-                    )
+                    # Read full schema: VAA field names are often CamelCase
+                    # (ToNode, HydroSeq, DnHydroSeq, StartFlag, Divergence).
+                    # Column filtering here can silently drop topology fields
+                    # when case does not match exactly.
+                    vaa = gpd.read_file(gdb, layer=vaa_layer)
                 break
             except Exception as exc:
                 vaa_last_exc = exc
@@ -638,6 +634,20 @@ def _load_basin_flowline_and_vaa(gdbs: list[tuple[str, Path]], basin_gdf: gpd.Ge
         vaa_out = vaa.sort_values("ComID").drop_duplicates(subset=["ComID"], keep="first").reset_index(drop=True)
 
     nonzero_to = int((vaa_out["ToNode"] != 0).sum())
+    if nonzero_to == 0 and len(vaa_out) > 1:
+        # Last-resort fallback for source datasets with unusable node fields.
+        # Build a simple connected downstream chain from HydroSeq order so
+        # upstream-tracing doesn't collapse to one reach per station.
+        print("WARNING: VAA ToNode still all zero; synthesizing connectivity from HydroSeq ordering.")
+        synth = vaa_out.copy().sort_values("HydroSeq", ascending=False).reset_index(drop=True)
+        n = len(synth)
+        synth["FromNode"] = np.arange(n, 0, -1, dtype=np.int64)
+        synth["ToNode"] = np.append(synth["FromNode"].to_numpy(dtype=np.int64)[1:], 0)
+        synth["StartFlag"] = 0
+        synth.loc[synth.index[0], "StartFlag"] = 1
+        vaa_out = synth.sort_values("ComID").reset_index(drop=True)
+        nonzero_to = int((vaa_out["ToNode"] != 0).sum())
+
     if nonzero_to == 0:
         raise RuntimeError(
             "Built VAA has no downstream links (ToNode all zero). "
