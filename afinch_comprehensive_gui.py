@@ -1146,46 +1146,18 @@ class AFinchComprehensiveGUI:
         catchment_gpkg = base / "inputData" / f"NHDPlusCatchment_{ths}.gpkg"
         flowline_shp   = hsr_dir / "Flowlines" / "nhdflowline.txt"
 
-        if catchment_gpkg.exists():
-            self._log(f"Loading reach geometry from {catchment_gpkg}\n")
-            geom_gdf = gpd.read_file(catchment_gpkg)
-            comid_field = "NHDPlusID" if "NHDPlusID" in geom_gdf.columns else geom_gdf.columns[0]
-            geom_gdf = geom_gdf.rename(columns={comid_field: "ComID"})
-        else:
-            # Try to load geometries from NHD source
-            self._log("Catchment GeoPackage not found. Attempting to load from NHD source...\n")
-            nhd_dir = Path(self.v_nhd_dir.get().strip())
-            if not nhd_dir.exists():
-                raise FileNotFoundError(
-                    f"Neither {catchment_gpkg} nor NHD directory found. "
-                    "Run 'Build Network' first."
-                )
-            # Load reach table to get ComIDs, build point-geometry fallback
-            reach_tbl = pd.read_csv(flowline_shp)
-            nhdflowline_col = "ComID" if "ComID" in reach_tbl.columns else reach_tbl.columns[0]
-            comids = reach_tbl[nhdflowline_col].dropna().astype("int64").tolist()
-            self._log(f"⚠ No geometry available for {len(comids)} reaches. Shapefile will be geometry-only if NHD load fails.\n", "warn")
-            # Load NHDFlowline geometries from GDB directories
-            gdbs = sorted(nhd_dir.rglob("*.gdb"))
-            if not gdbs:
-                raise FileNotFoundError(f"No .gdb files found under {nhd_dir}")
-            parts = []
-            for gdb in gdbs:
-                try:
-                    fl = gpd.read_file(gdb, layer="NHDFlowline")
-                    fl = fl.rename(columns={c: c.lower() for c in fl.columns})
-                    if "permanent_identifier" in fl.columns:
-                        fl["ComID"] = pd.to_numeric(fl["permanent_identifier"], errors="coerce")
-                    fl = fl[fl["ComID"].isin(comids)].copy()
-                    if not fl.empty:
-                        parts.append(fl[["ComID", "geometry"]])
-                except Exception:
-                    continue
-            if not parts:
-                raise RuntimeError("Could not load any NHD flowline geometries matching your basin.")
-            geom_gdf = pd.concat(parts, ignore_index=True)
-            geom_gdf["ComID"] = geom_gdf["ComID"].astype("int64")
-            geom_gdf = gpd.GeoDataFrame(geom_gdf, geometry="geometry", crs="EPSG:4269")
+        # PRIORITY: Load from catchment GeoPackage which contains the matching HSR ComIDs
+        if not catchment_gpkg.exists():
+            raise FileNotFoundError(
+                f"Catchment GeoPackage not found: {catchment_gpkg}\n"
+                "The shapefile export requires the HSR network build output.\n"
+                "Run 'Build Network' first."
+            )
+
+        self._log(f"Loading reach geometry from {catchment_gpkg}\n")
+        geom_gdf = gpd.read_file(catchment_gpkg)
+        comid_field = "NHDPlusID" if "NHDPlusID" in geom_gdf.columns else geom_gdf.columns[0]
+        geom_gdf = geom_gdf.rename(columns={comid_field: "ComID"})
 
         geom_gdf["ComID"] = pd.to_numeric(geom_gdf["ComID"], errors="coerce").astype("Int64")
         geom_gdf = geom_gdf.dropna(subset=["ComID"])
@@ -1215,6 +1187,20 @@ class AFinchComprehensiveGUI:
             mo_data = flow_df[[comid_col, src_col]].rename(columns={comid_col: "ComID", src_col: col_name})
             mo_data["ComID"] = mo_data["ComID"].astype("int64")
             out_df = out_df.merge(mo_data, on="ComID", how="left")
+
+        # ── Validate that flow data merged successfully ────────────────────────
+        cfs_cols = [c for c in out_df.columns if "CFS" in c]
+        if cfs_cols:
+            non_null_counts = out_df[cfs_cols].notna().sum()
+            nan_pct = (1 - non_null_counts / len(out_df)) * 100
+            for col, pct in zip(cfs_cols, nan_pct):
+                if pct > 50:
+                    self._log(
+                        f"⚠ WARNING: {col} is {pct:.1f}% NaN. ComID merge may have failed.\n"
+                        f"  Geometry ComID range: {out_df['ComID'].min()} to {out_df['ComID'].max()}\n"
+                        f"  Flow data ComID range: {flow_df[comid_col].min()} to {flow_df[comid_col].max()}\n",
+                        "warn"
+                    )
 
         out_gdf = gpd.GeoDataFrame(out_df, geometry="geometry", crs=geom_gdf.crs)
 
