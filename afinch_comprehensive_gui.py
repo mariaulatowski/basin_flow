@@ -27,6 +27,8 @@ import pickle
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
+import geopandas as gpd
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Palette and fonts
 # ──────────────────────────────────────────────────────────────────────────────
@@ -726,6 +728,25 @@ class AFinchComprehensiveGUI:
             raise FileNotFoundError(f"Upstream mapping script not found:\n{script_path}")
 
         catchment_rel = f"inputData/NHDPlusCatchment_{cfg['ths']}.gpkg"
+        catchment_path = base / catchment_rel
+        if not catchment_path.exists():
+            self._log(
+                f"Skipping legacy upstream gaged-catchment build: catchment file not found ({catchment_path}).\n",
+                "warn",
+            )
+            return
+
+        catchments = gpd.read_file(catchment_path)
+        geom_types = set(catchments.geometry.geom_type.dropna().astype(str))
+        polygon_types = {"Polygon", "MultiPolygon"}
+        if geom_types and not geom_types.issubset(polygon_types):
+            self._log(
+                "Skipping legacy upstream gaged-catchment build: "
+                f"{catchment_path.name} contains {sorted(geom_types)} geometry, but the legacy script requires polygon catchments.\n",
+                "warn",
+            )
+            return
+
         cmd = [
             sys.executable,
             str(script_path),
