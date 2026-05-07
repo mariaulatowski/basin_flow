@@ -454,6 +454,32 @@ def _discover_hu4_gdbs(base_dir: Path, gdb_root: str, basin_gdf: gpd.GeoDataFram
     return hits
 
 
+def _load_selected_hu4_mask(hu4_gdbs: list[tuple[str, Path]], basin_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    mask_parts: list[gpd.GeoDataFrame] = []
+    for hu4, gdb in hu4_gdbs:
+        wbd = gpd.read_file(gdb, layer="WBDHU4")
+        if wbd.empty:
+            continue
+        huc4_col = next((c for c in wbd.columns if c.lower() == "huc4"), None)
+        if huc4_col is not None:
+            wbd = wbd[wbd[huc4_col].astype(str) == str(hu4)]
+        if wbd.empty:
+            continue
+        if wbd.crs is None:
+            wbd = wbd.set_crs(basin_gdf.crs or "EPSG:4269")
+        mask_parts.append(wbd[["geometry"]].copy())
+
+    if not mask_parts:
+        raise ValueError("Selected HU4 polygons could not be loaded from WBDHU4 layers")
+
+    mask = gpd.GeoDataFrame(pd.concat(mask_parts, ignore_index=True), geometry="geometry", crs=mask_parts[0].crs)
+    mask = mask.to_crs(basin_gdf.crs or mask.crs)
+    basin_union = basin_gdf.geometry.union_all()
+    hu4_union = mask.geometry.union_all()
+    clipped = hu4_union.intersection(basin_union)
+    return gpd.GeoDataFrame({"geometry": [clipped]}, geometry="geometry", crs=basin_gdf.crs or mask.crs)
+
+
 def _load_basin_flowline_and_vaa(gdbs: list[tuple[str, Path]], basin_gdf: gpd.GeoDataFrame, ths: str) -> tuple[pd.DataFrame, pd.DataFrame, gpd.GeoDataFrame]:
     import warnings
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -658,8 +684,23 @@ def _load_basin_flowline_and_vaa(gdbs: list[tuple[str, Path]], basin_gdf: gpd.Ge
     return flow_tbl, vaa_out, flow_geom[["ComID", "ReachCode", "OrigReachCode", "geometry"]].copy()
 
 
-def _map_stations_to_comid(flow_geom: gpd.GeoDataFrame, station_points: pd.DataFrame) -> pd.DataFrame:
+def _map_stations_to_comid(
+    flow_geom: gpd.GeoDataFrame,
+    station_points: pd.DataFrame,
+    station_mask: gpd.GeoDataFrame | None = None,
+) -> pd.DataFrame:
     pts = gpd.GeoDataFrame(station_points.copy(), geometry=gpd.points_from_xy(station_points["LONG"], station_points["LAT"]), crs="EPSG:4326")
+
+    if station_mask is not None:
+        mask = station_mask.copy()
+        if mask.crs is None:
+            mask = mask.set_crs("EPSG:4269")
+        mask = mask.to_crs(pts.crs)
+        keep = pts.geometry.intersects(mask.geometry.union_all())
+        kept = int(keep.sum())
+        dropped = int((~keep).sum())
+        print(f"Filtered stations to selected HU4 footprint: kept {kept:,}, dropped {dropped:,}")
+        pts = pts.loc[keep].copy()
 
     flow_gdf = flow_geom.copy()
     if flow_gdf.crs is None:
@@ -792,6 +833,7 @@ def main() -> None:
     basin_gdf = _load_basin_polygon(base_dir, args.basin_shp, args.basin_field, args.basin_value)
     hu4_gdbs = _discover_hu4_gdbs(base_dir, args.gdb_root, basin_gdf, args.hu4s)
     hu4_codes = [code for code, _ in hu4_gdbs]
+    station_mask = _load_selected_hu4_mask(hu4_gdbs, basin_gdf)
     print(f"Selected HU4 geodatabases: {', '.join(hu4_codes)}")
 
     flow_tbl, vaa_tbl, flow_geom = _load_basin_flowline_and_vaa(hu4_gdbs, basin_gdf, args.ths)
@@ -799,7 +841,7 @@ def main() -> None:
     print(f"Flowlines prepared: {len(flow_tbl):,} reaches")
 
     station_points = _load_station_points_flexible(base_dir, args.gages_csv, args.wam_csv)
-    station_map = _map_stations_to_comid(flow_geom, station_points)
+    station_map = _map_stations_to_comid(flow_geom, station_points, station_mask=station_mask)
     print(f"Station mappings prepared: {len(station_map):,} stations")
     print(f"Station map unique COMIDs: {station_map['ComID'].nunique():,} / stations {len(station_map):,}")
 
@@ -899,7 +941,12 @@ def main() -> None:
         da = pd.read_csv(da_path) if da_path.exists() else pd.DataFrame(columns=["Station", "ComID", "DASqMi"])
 
     reach_lookup = flow_geom.set_index("ComID")["ReachCode"].to_dict()
-    da_map = da.set_index("Station")["DASqMi"].to_dict() if not da.empty else {}
+    if not da.empty:
+        da = da.copy()
+        da["Station"] = da["Station"].map(_norm_station_id)
+        da_map = da.set_index("Station")["DASqMi"].to_dict()
+    else:
+        da_map = {}
     station_list_path = gaged_dir / "StationList.txt"
     station_ids = station_map["Station"].astype(str).sort_values().tolist()
     station_list_path.write_text("\n".join(station_ids) + "\n", encoding="utf-8")

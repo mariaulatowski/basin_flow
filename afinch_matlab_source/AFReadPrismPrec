@@ -24,12 +24,13 @@ class PrismPrecResult:
 def read_prism_prec(
     base_dir: Path | str,
     ths: str,
+    hsr: str | None,
     wy: int,
     comid_ths_flowline: Iterable[int],
     gridcode_ths_nlcd: Iterable[int] | None = None,
 ) -> PrismPrecResult:
     base_dir = Path(base_dir)
-    hsr = f"HSR{ths[:2]}00"
+    hsr = hsr or f"HSR{ths[:2]}00"
     prism_path = base_dir / hsr / "PRISM" / "Precipitation" / f"PrismPrecipWY{wy}.dat"
     xwalk_path = base_dir / hsr / "Flowlines" / "GridCodeComID.txt"
 

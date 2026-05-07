@@ -151,6 +151,7 @@ class AFinchComprehensiveGUI:
         self.v_gages_csv       = tk.StringVar()
         self.v_wam_csv         = tk.StringVar()
         self.v_usgs_only       = tk.BooleanVar(value=False)
+        self.v_hu4_codes       = tk.StringVar(value="")
         self.v_hsr_name        = tk.StringVar(value="HSR1200")
         self.v_ths_code        = tk.StringVar(value="1200")
 
@@ -286,6 +287,28 @@ class AFinchComprehensiveGUI:
         # HSR / THS identifiers
         s4 = Section(outer, "Model Identifiers")
         s4.pack(fill="x", padx=6, pady=(6, 8))
+        row_hu4 = tk.Frame(s4, bg=PANEL)
+        row_hu4.pack(fill="x", pady=(0, 4))
+        tk.Label(row_hu4, text="Hydrologic Subregion (HU4):", font=LABEL_FONT, bg=PANEL).pack(side="left", padx=(0, 6))
+        tk.Entry(row_hu4, textvariable=self.v_hu4_codes, width=16, font=ENTRY_FONT).pack(side="left", padx=(0, 6))
+        tk.Button(
+            row_hu4,
+            text="Apply to THS/HSR",
+            command=self._apply_hu4_to_ids,
+            font=SMALL_FONT,
+            bg=ACCENT,
+            fg="white",
+            relief="flat",
+            padx=6,
+        ).pack(side="left")
+        tk.Label(
+            row_hu4,
+            text="Optional: 4-digit code (e.g., 1206) or comma-list for multi-HU4 build",
+            font=SMALL_FONT,
+            fg="#666",
+            bg=PANEL,
+        ).pack(side="left", padx=8)
+
         row_ids = tk.Frame(s4, bg=PANEL)
         row_ids.pack(fill="x")
         tk.Label(row_ids, text="HSR Folder Name:", font=LABEL_FONT, bg=PANEL).grid(row=0, column=0, sticky="w", padx=(0, 4))
@@ -349,7 +372,9 @@ class AFinchComprehensiveGUI:
             "Build Network prepares all the HSR data files the model needs:\n\n"
             "  • Clips NHD flowlines to your basin polygon\n"
             "  • Discovers which HU4 datasets intersect the basin\n"
+            "  • If HU4 is specified, restricts the build to that subregion(s)\n"
             "  • Snaps your gage stations to the nearest NHD reach (ComID)\n"
+            "  • Filters submitted gages to only those inside selected HU4 footprint\n"
             "  • Extracts NLCD land-cover percentages per reach\n"
             "  • Extracts PRISM precipitation/temperature per reach for the chosen year\n"
             "  • Writes all required HSR files  (Flowlines/, NLCD/, PRISM/, GagedCatchments/, etc.)\n\n"
@@ -671,6 +696,8 @@ class AFinchComprehensiveGUI:
             "--prism-ppt-dir",   cfg["prism_ppt_rel"],
             "--prism-tmean-dir", cfg["prism_tmean_rel"],
         ]
+        if cfg.get("hu4s"):
+            cmd += ["--hu4s", cfg["hu4s"]]
         if cfg.get("gages_csv"):
             cmd += ["--gages-csv", cfg["gages_csv"]]
         if cfg.get("wam_csv"):
@@ -761,10 +788,21 @@ class AFinchComprehensiveGUI:
             except ValueError:
                 return str(p)
 
+        hu4s = self.v_hu4_codes.get().strip().replace(" ", "")
+        if hu4s:
+            hu4_parts = [p for p in hu4s.split(",") if p]
+            if not hu4_parts:
+                raise ValueError("HU4 selection is empty after parsing.")
+            bad = [p for p in hu4_parts if not (len(p) == 4 and p.isdigit())]
+            if bad:
+                raise ValueError(f"Invalid HU4 code(s): {', '.join(bad)}. Use 4-digit values like 1206.")
+            hu4s = ",".join(hu4_parts)
+
         return {
             "base_dir":       base,
             "ths":            self.v_ths_code.get().strip(),
             "hsr":            self.v_hsr_name.get().strip(),
+            "hu4s":           hu4s,
             "basin_shp_rel":  rel(basin_shp),
             "basin_field":    self.v_basin_field.get().strip(),
             "basin_value":    self.v_basin_value.get().strip(),
@@ -776,6 +814,27 @@ class AFinchComprehensiveGUI:
             "gages_csv":      self.v_gages_csv.get().strip(),
             "wam_csv":        "NONE" if self.v_usgs_only.get() else self.v_wam_csv.get().strip(),
         }
+
+    def _apply_hu4_to_ids(self):
+        hu4s = self.v_hu4_codes.get().strip().replace(" ", "")
+        if not hu4s:
+            messagebox.showinfo("HU4", "Enter a 4-digit HU4 code first (e.g., 1206).")
+            return
+        parts = [p for p in hu4s.split(",") if p]
+        if len(parts) != 1:
+            messagebox.showinfo(
+                "HU4",
+                "Auto-apply to THS/HSR supports one HU4 code at a time.\n"
+                "For multi-HU4 builds, keep THS/HSR as desired manually.",
+            )
+            return
+        code = parts[0]
+        if not (len(code) == 4 and code.isdigit()):
+            messagebox.showerror("HU4", f"Invalid HU4 code: {code}. Use 4 digits (e.g., 1206).")
+            return
+        self.v_ths_code.set(code)
+        self.v_hsr_name.set(f"HSR{code}")
+        self._log(f"Applied HU4 {code} -> THS={code}, HSR=HSR{code}\n", "ok")
 
     # ── Run Model ────────────────────────────────────────────────────────────
 
@@ -806,9 +865,10 @@ class AFinchComprehensiveGUI:
 
         self._log(f"Loading pipeline from: {runner}\n")
         mod = self._load_module("afinch_gui_runner", runner)
-        # Default regression window to the modeled run window unless explicitly overridden.
-        reg_wy_start = cfg["wy_start"]
-        reg_ny = cfg["ny"]
+        # Use pipeline defaults for regression calibration years (typically multi-year),
+        # then fall back to the modeled run window if defaults are unavailable.
+        reg_wy_start = int(getattr(mod, "WY1_REG", cfg["wy_start"]))
+        reg_ny = int(getattr(mod, "NY_REG", cfg["ny"]))
         self._pipeline = mod.ConvertedAFinchPipeline(
             base_dir=cfg["base_dir"],
             src_dir=cfg["base_dir"] / "afinch_matlab_source",
@@ -822,7 +882,7 @@ class AFinchComprehensiveGUI:
         )
         self._log(
             f"Regression window: WY{reg_wy_start}-{reg_wy_start + reg_ny - 1} "
-            f"(matched to model run window)\n"
+            f"(pipeline default calibration window)\n"
         )
         self._pipeline_sig = sig
         self._completed_steps.clear()

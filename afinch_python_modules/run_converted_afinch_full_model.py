@@ -16,8 +16,8 @@ import geopandas as gpd
 ROOT = Path(r"c:\Users\mu3575\Documents\WAM")
 SRC = ROOT / "afinch_matlab_source"
 
-THS = "1200"
-HSR_KEY = "HSR1200"
+THS = "1206"
+HSR_KEY = "HSR1206"
 WY1 = 2018
 NY = 1
 # Multi-year regression parameters: use 2010-2024 for predictor building
@@ -359,12 +359,13 @@ class ConvertedAFinchPipeline:
         ]
         self.ctx.mo_name = ["Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep"]
 
-        self.ctx.nlcd = m["nlcd"].read_nlcd(self.base_dir, self.ths)
+        self.ctx.nlcd = m["nlcd"].read_nlcd(self.base_dir, self.ths, hsr=self.hsr_key)
         self.log(f"NLCD loaded: comids={len(self.ctx.nlcd.comid_ths)}\n")
 
         self.ctx.prism = m["prec"].read_prism_prec(
             base_dir=self.base_dir,
             ths=self.ths,
+            hsr=self.hsr_key,
             wy=self.ctx.wy,
             comid_ths_flowline=self.ctx.nlcd.comid_ths,
             gridcode_ths_nlcd=self.ctx.nlcd.gridcode_ths,
@@ -484,6 +485,7 @@ class ConvertedAFinchPipeline:
             "StaNdx": self.ctx.sta_res.sta_ndx,
             "NStaAct": self.ctx.sta_res.sta_hist[0].n_sta_act,
             "QTotWY": self.ctx.sta_res.sta_hist[0].q_tot_wy,
+            "NHD_Area_IWY": np.asarray(self.ctx.sta_res.sta_hist[0].nhd_area_iwy, dtype=float),
             "YAdjIncWY": _station_y_adj_inc(
                 self.ctx.plot_res.q_adj_inc_wy,
                 self.ctx.sta_res.sta_hist[0].nhd_area_iwy,
@@ -519,6 +521,7 @@ class ConvertedAFinchPipeline:
             prism = m["prec"].read_prism_prec(
                 base_dir=self.base_dir,
                 ths=self.ths,
+                hsr=self.hsr_key,
                 wy=wy_reg,
                 comid_ths_flowline=self.ctx.nlcd.comid_ths,
                 gridcode_ths_nlcd=self.ctx.nlcd.gridcode_ths,
@@ -680,6 +683,7 @@ class ConvertedAFinchPipeline:
                 "StaNdx": sta_ndx_reg,
                 "NStaAct": sta_res.sta_hist[0].n_sta_act,
                 "QTotWY": sta_res.sta_hist[0].q_tot_wy,
+                "NHD_Area_IWY": np.asarray(sta_res.sta_hist[0].nhd_area_iwy, dtype=float),
                 "YAdjIncWY": _station_y_adj_inc(q_adj_inc_wy, sta_res.sta_hist[0].nhd_area_iwy, days_in_mo_reg),
             }
             self._sta_hist_list_reg.append(sta_hist)
@@ -764,7 +768,7 @@ class ConvertedAFinchPipeline:
                         f"Missing station struct in regression data: WY{wy1_for_reg + iy}, StaNdx={sidx}"
                     )
 
-        nr = 6
+        nr = 10
         self.ctx.cb_matrix = np.zeros((nr, 24), dtype=int)
         self.ctx.cb_matrix[0, 21] = 1
         self.ctx.cb_matrix[1, 22] = 1
@@ -778,7 +782,31 @@ class ConvertedAFinchPipeline:
         self.ctx.cb_matrix[5, 13] = 1
         self.ctx.cb_matrix[5, 14] = 1
         self.ctx.cb_matrix[5, 15] = 1
-        self.ctx.reg_var_name = ["PPT", "TEMP", "PPT_LAG1", "NLCD_DEV", "NLCD_FOR", "NLCD_AG"]
+        self.ctx.cb_matrix[5, 16] = 1
+        self.ctx.cb_matrix[5, 17] = 1
+        self.ctx.cb_matrix[5, 18] = 1
+        self.ctx.cb_matrix[6, 0] = 1
+        self.ctx.cb_matrix[6, 1] = 1
+        self.ctx.cb_matrix[7, 5] = 1
+        self.ctx.cb_matrix[7, 6] = 1
+        self.ctx.cb_matrix[7, 7] = 1
+        self.ctx.cb_matrix[8, 11] = 1
+        self.ctx.cb_matrix[8, 12] = 1
+        self.ctx.cb_matrix[8, 13] = 1
+        self.ctx.cb_matrix[9, 19] = 1
+        self.ctx.cb_matrix[9, 20] = 1
+        self.ctx.reg_var_name = [
+            "PPT",
+            "TEMP",
+            "PPT_LAG1",
+            "NLCD_DEV",
+            "NLCD_FOR",
+            "NLCD_AG",
+            "NLCD_WATER",
+            "NLCD_BARREN",
+            "NLCD_SHRUB_GRASS",
+            "NLCD_WETLAND",
+        ]
 
         p_cols = [f"PIn_{i:02d}" for i in range(1, 13)]
         reg_prsm_prec = self._prsm_prec_reg
@@ -938,6 +966,8 @@ def run() -> None:
         hsr_key=HSR_KEY,
         wy1=WY1,
         ny=NY,
+        wy1_reg=WY1_REG,
+        ny_reg=NY_REG,
         logger=print,
     )
     ctx = pipeline.run_all()

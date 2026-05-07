@@ -118,13 +118,7 @@ def read_prism_temp(
     # ------------------------------------------------------------------
     # 1. Read temperature file
     # ------------------------------------------------------------------
-    temp_file = (
-        base_dir
-        / f"HSR{ths[:2]}00"
-        / "PRISM"
-        / "Temperature"
-        / f"PrismTempAveWY{wy}.dat"
-    )
+    temp_file = base_dir / hsr / "PRISM" / "Temperature" / f"PrismTempAveWY{wy}.dat"
     temp_df = pd.read_csv(
         temp_file,
         sep=r"\s+",

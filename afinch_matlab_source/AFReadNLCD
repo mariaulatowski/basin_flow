@@ -23,9 +23,9 @@ class NLCDResult:
     flowline_ths: pd.DataFrame
 
 
-def read_nlcd(base_dir: Path | str, ths: str) -> NLCDResult:
+def read_nlcd(base_dir: Path | str, ths: str, hsr: str | None = None) -> NLCDResult:
     base_dir = Path(base_dir)
-    hsr = f"HSR{ths[:2]}00"
+    hsr = hsr or f"HSR{ths[:2]}00"
 
     nlcd_path = base_dir / hsr / "NLCD" / "catchmentattributesnlcd.txt"
     nhd_path = base_dir / hsr / "Flowlines" / "nhdflowline.txt"
@@ -43,7 +43,7 @@ def read_nlcd(base_dir: Path | str, ths: str) -> NLCDResult:
     if "ComID" not in flow.columns:
         flow.columns = ["ComID", "LengthKm", "ReachCode", *[f"c{i}" for i in range(len(flow.columns) - 3)]]
 
-    # The nhdflowline.txt inside HSR{ths}00/Flowlines is already THS-specific,
+    # The nhdflowline.txt inside the selected HSR/Flowlines is already THS-specific,
     # so no ReachCode prefix filter is applied — use all rows.
     flow_ths = flow.copy()
     merged = flow_ths[["ComID"]].merge(nlcd[["ComID", "GridCode", *NLCD_COLS]], on="ComID", how="inner")
