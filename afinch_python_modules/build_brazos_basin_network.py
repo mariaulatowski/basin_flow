@@ -416,6 +416,43 @@ def _load_basin_polygon(base_dir: Path, basin_shp: str, basin_field: str, basin_
     return basin
 
 
+def _load_forced_hu4_polygon(base_dir: Path, gdb_root: str, forced_hu4s: str) -> gpd.GeoDataFrame:
+    root = (base_dir / gdb_root).resolve()
+    if not root.exists():
+        raise FileNotFoundError(root)
+
+    forced = [item.strip() for item in forced_hu4s.split(",") if item.strip()]
+    if not forced:
+        raise ValueError("HU4-only build requested, but no HU4 codes were provided.")
+
+    mask_parts: list[gpd.GeoDataFrame] = []
+    gdb_candidates = sorted(root.glob("NHD_H_*_HU4_GDB/*.gdb")) + sorted(root.glob("NHDPLUS_H_*_HU4_GDB/*.gdb"))
+    for gdb in gdb_candidates:
+        parts = gdb.parent.name.split("_")
+        if len(parts) < 4:
+            continue
+        hu4 = parts[2]
+        if hu4 not in forced:
+            continue
+
+        wbd = gpd.read_file(gdb, layer="WBDHU4")
+        if wbd.empty:
+            continue
+        huc4_col = next((c for c in wbd.columns if c.lower() == "huc4"), None)
+        if huc4_col is not None:
+            wbd = wbd[wbd[huc4_col].astype(str) == hu4]
+        if wbd.empty:
+            continue
+        if wbd.crs is None:
+            wbd = wbd.set_crs("EPSG:4269")
+        mask_parts.append(wbd[["geometry"]].copy())
+
+    if not mask_parts:
+        raise ValueError(f"Could not load WBDHU4 polygons for HU4(s): {', '.join(forced)}")
+
+    return gpd.GeoDataFrame(pd.concat(mask_parts, ignore_index=True), geometry="geometry", crs=mask_parts[0].crs)
+
+
 def _discover_hu4_gdbs(base_dir: Path, gdb_root: str, basin_gdf: gpd.GeoDataFrame, forced_hu4s: str) -> list[tuple[str, Path]]:
     root = (base_dir / gdb_root).resolve()
     if not root.exists():
@@ -830,7 +867,11 @@ def main() -> None:
     base_dir = Path(args.base_dir).resolve()
     hsr_dir = base_dir / args.hsr
 
-    basin_gdf = _load_basin_polygon(base_dir, args.basin_shp, args.basin_field, args.basin_value)
+    if str(args.hu4s).strip() and not str(args.basin_shp).strip():
+        basin_gdf = _load_forced_hu4_polygon(base_dir, args.gdb_root, args.hu4s)
+        print(f"Using HU4-only build extent from WBDHU4 polygons: {args.hu4s}")
+    else:
+        basin_gdf = _load_basin_polygon(base_dir, args.basin_shp, args.basin_field, args.basin_value)
     hu4_gdbs = _discover_hu4_gdbs(base_dir, args.gdb_root, basin_gdf, args.hu4s)
     hu4_codes = [code for code, _ in hu4_gdbs]
     station_mask = _load_selected_hu4_mask(hu4_gdbs, basin_gdf)

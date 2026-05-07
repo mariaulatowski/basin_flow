@@ -261,6 +261,13 @@ class AFinchComprehensiveGUI:
         self._basin_menu.pack(side="left", padx=4)
         tk.Label(row_field, text="   (or type manually)", font=SMALL_FONT, fg="#777", bg=PANEL).pack(side="left")
         tk.Entry(row_field, textvariable=self.v_basin_value, width=20, font=ENTRY_FONT).pack(side="left", padx=4)
+        tk.Label(
+            s1,
+            text="Optional when HU4 is specified. Leave basin blank for HU4-only builds.",
+            font=SMALL_FONT,
+            fg="#666",
+            bg=PANEL,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 0))
 
         # NHD source
         s2 = Section(outer, "NHD Flowline Source")
@@ -689,15 +696,18 @@ class AFinchComprehensiveGUI:
             "--base-dir",   str(base),
             "--ths",        cfg["ths"],
             "--hsr",        cfg["hsr"],
-            "--basin-shp",  cfg["basin_shp_rel"],
-            "--basin-field", cfg["basin_field"],
-            "--basin-value", cfg["basin_value"],
             "--gdb-root",   cfg["nhd_rel"],
             "--wy",         str(cfg["build_wy"]),
             "--nlcd-raster", cfg["nlcd_rel"],
             "--prism-ppt-dir",   cfg["prism_ppt_rel"],
             "--prism-tmean-dir", cfg["prism_tmean_rel"],
         ]
+        if cfg.get("basin_shp_rel"):
+            cmd += [
+                "--basin-shp", cfg["basin_shp_rel"],
+                "--basin-field", cfg["basin_field"],
+                "--basin-value", cfg["basin_value"],
+            ]
         if cfg.get("hu4s"):
             cmd += ["--hu4s", cfg["hu4s"]]
         if cfg.get("gages_csv"):
@@ -783,9 +793,16 @@ class AFinchComprehensiveGUI:
         if not base.exists():
             raise FileNotFoundError(f"Base directory not found: {base}")
 
-        basin_shp = Path(self.v_basin_shp.get().strip())
-        if not basin_shp.exists():
-            raise FileNotFoundError(f"Basin shapefile not found: {basin_shp}")
+        hu4s = self.v_hu4_codes.get().strip().replace(" ", "")
+
+        basin_shp_str = self.v_basin_shp.get().strip()
+        basin_shp: Path | None = None
+        if basin_shp_str:
+            basin_shp = Path(basin_shp_str)
+            if not basin_shp.exists():
+                raise FileNotFoundError(f"Basin shapefile not found: {basin_shp}")
+        elif not hu4s:
+            raise FileNotFoundError("Set a basin shapefile or specify a HU4 code for a HU4-only build.")
 
         nhd = Path(self.v_nhd_dir.get().strip())
         if not nhd.exists():
@@ -809,7 +826,6 @@ class AFinchComprehensiveGUI:
             except ValueError:
                 return str(p)
 
-        hu4s = self.v_hu4_codes.get().strip().replace(" ", "")
         if hu4s:
             hu4_parts = [p for p in hu4s.split(",") if p]
             if not hu4_parts:
@@ -824,7 +840,7 @@ class AFinchComprehensiveGUI:
             "ths":            self.v_ths_code.get().strip(),
             "hsr":            self.v_hsr_name.get().strip(),
             "hu4s":           hu4s,
-            "basin_shp_rel":  rel(basin_shp),
+            "basin_shp_rel":  rel(basin_shp) if basin_shp is not None else "",
             "basin_field":    self.v_basin_field.get().strip(),
             "basin_value":    self.v_basin_value.get().strip(),
             "nhd_rel":        rel(nhd),
@@ -1087,17 +1103,23 @@ class AFinchComprehensiveGUI:
         hsr_dir = base / hsr_key
 
         # ── 1. Load accumulated flow data from HSR output ──────────────────────
-        # Try the QY output file from step 6 (AFConFlowAccum writes QY*.dat files)
-        flow_file = hsr_dir / "Output" / f"QYConWY{wy}.dat"
+        flow_file = hsr_dir / "Output" / "FlowAccum" / f"ComIDQ12WY{wy}.csv"
         if not flow_file.exists():
-            # Fallback: look for any QY dat in output
-            candidates = sorted((hsr_dir / "Output").glob(f"QYCon*{wy}*.dat")) if (hsr_dir / "Output").exists() else []
-            if not candidates:
-                raise FileNotFoundError(
-                    f"Accumulated flow file not found: {flow_file}\n"
-                    f"Run Steps 1-6 first, or check that WY{wy} data exists in {hsr_dir / 'Output'}"
-                )
-            flow_file = candidates[0]
+            candidates = sorted((hsr_dir / "Output" / "FlowAccum").glob(f"ComIDQ12WY{wy}*.csv")) if (hsr_dir / "Output" / "FlowAccum").exists() else []
+            if candidates:
+                flow_file = candidates[0]
+            else:
+                legacy = hsr_dir / "Output" / f"QYConWY{wy}.dat"
+                legacy_candidates = sorted((hsr_dir / "Output").glob(f"QYCon*{wy}*.dat")) if (hsr_dir / "Output").exists() else []
+                if legacy.exists():
+                    flow_file = legacy
+                elif legacy_candidates:
+                    flow_file = legacy_candidates[0]
+                else:
+                    raise FileNotFoundError(
+                        f"Accumulated flow file not found: {flow_file}\n"
+                        f"Run Steps 1-6 first, or check that WY{wy} data exists in {hsr_dir / 'Output' / 'FlowAccum'}"
+                    )
             self._log(f"Using accumulated flow file: {flow_file}\n")
 
         # Read flow data — expect columns: ComID, M01..M12 (CFS)
