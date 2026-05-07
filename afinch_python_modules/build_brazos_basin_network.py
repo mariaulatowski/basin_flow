@@ -867,7 +867,10 @@ def main() -> None:
     base_dir = Path(args.base_dir).resolve()
     hsr_dir = base_dir / args.hsr
 
-    if str(args.hu4s).strip() and not str(args.basin_shp).strip():
+    basin_shp_arg = str(args.basin_shp).strip()
+    basin_shp_exists = bool(basin_shp_arg) and (base_dir / basin_shp_arg).resolve().exists()
+
+    if str(args.hu4s).strip() and not basin_shp_exists:
         basin_gdf = _load_forced_hu4_polygon(base_dir, args.gdb_root, args.hu4s)
         print(f"Using HU4-only build extent from WBDHU4 polygons: {args.hu4s}")
     else:
