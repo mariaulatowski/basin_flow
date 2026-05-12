@@ -3,6 +3,7 @@ from __future__ import annotations
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
+import os
 import sys
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -11,6 +12,9 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+
+
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 
 ROOT = Path(r"c:\Users\mu3575\Documents\WAM")
@@ -382,6 +386,7 @@ class ConvertedAFinchPipeline:
             "temp": self._load("m_AFReadPrismTemp", "AFReadPrismTemp"),
             "regpoa": self._load("m_AFRegressPOA", "AFRegressPOA"),
             "regwy": self._load("m_AFRegressByWY", "AFRegressByWY"),
+            "plotcoeff": self._load("m_AFPlotRegressCoeff", "AFPlotRegressCoeff"),
             "lag": self._load("m_AFGenLag1Precp", "AFGenLag1Precp"),
             "qest": self._load("m_AFQEstAdjInc", "AFQEstAdjInc"),
             "qcon": self._load("m_AFQConAdjInc", "AFQConAdjInc"),
@@ -630,8 +635,8 @@ class ConvertedAFinchPipeline:
         self._sta_hist_list_reg = []
         temp_res_list = []
         afstruct_years: list[Any] = []
-        for wy_reg in years_for_regression:
-            prism = prism_list[years_for_regression.index(wy_reg)]
+        for iy, wy_reg in enumerate(years_for_regression):
+            prism = prism_list[iy]
             setup_ctx = m["setup"].setup_data(wy1=wy_reg, iy=0, ths=self.ths)
             days_in_mo_reg = np.asarray(setup_ctx.days_in_mo, dtype=float)
 
@@ -923,7 +928,7 @@ class ConvertedAFinchPipeline:
             reg_var_name=self.ctx.reg_var_name,
             mo_name=self.ctx.mo_name,
             prompt_pvalues=lambda: (P_ENTER, P_REMOVE),
-            make_plot=False,
+            make_plot=True,
         )
         self._write_regression_diagnostics(
             reg_mat=self.ctx.reg_poa.reg_mat,
@@ -939,7 +944,21 @@ class ConvertedAFinchPipeline:
             wy1=wy1_for_reg,
             ny=ny_for_reg,
             month_name=self.ctx.month_name,
-            make_plots=False,
+            make_plots=True,
+        )
+
+        self._write_regression_observed_modeled(
+            reg_mat=self.ctx.reg_poa.reg_mat,
+            reg_month=self.ctx.reg_poa.reg_month,
+            reg_hist=self.ctx.reg_hist,
+            wy1=wy1_for_reg,
+            ny=ny_for_reg,
+        )
+        self._save_regression_plots(
+            reg_month=self.ctx.reg_poa.reg_month,
+            reg_hist=self.ctx.reg_hist,
+            wy1=wy1_for_reg,
+            ny=ny_for_reg,
         )
 
         self.log("Step 2 complete.\n")
@@ -988,6 +1007,124 @@ class ConvertedAFinchPipeline:
         summary_path = diag_dir / f"RegressionMonthlySummary_WY{wy1}_{wy1 + ny - 1}.csv"
         pd.DataFrame(rows).to_csv(summary_path, index=False)
         self.log(f"Regression diagnostics written: {design_path.name}, {summary_path.name}\n")
+
+    def _write_regression_observed_modeled(
+        self,
+        reg_mat: np.ndarray,
+        reg_month: list[Any],
+        reg_hist: list[list[Any]],
+        wy1: int,
+        ny: int,
+    ) -> None:
+        diag_dir = self.base_dir / self.hsr_key / "Output" / "Diagnostics"
+        diag_dir.mkdir(parents=True, exist_ok=True)
+
+        rows: list[dict[str, Any]] = []
+        for iy in range(ny):
+            wy = wy1 + iy
+            ndx_wy = np.flatnonzero(reg_mat[:, 0] == wy)
+            for im in range(12):
+                ndx_mo = np.flatnonzero(reg_mat[:, 2] == (im + 1))
+                ndx_obs = np.intersect1d(ndx_wy, ndx_mo)
+                if ndx_obs.size == 0:
+                    continue
+
+                observed = reg_mat[ndx_obs, 3].astype(float)
+                station_ids = reg_mat[ndx_obs, 1]
+                entry = reg_hist[iy][im]
+
+                ols_pred = np.asarray(entry.OLSPredRUAdj, dtype=float)
+                robust_pred = np.asarray(entry.RobustPredRUAdj, dtype=float)
+                if ols_pred.shape[0] != observed.shape[0]:
+                    ols_pred = np.full(observed.shape[0], np.nan, dtype=float)
+                if robust_pred.shape[0] != observed.shape[0]:
+                    robust_pred = np.full(observed.shape[0], np.nan, dtype=float)
+
+                ols_resid = observed - ols_pred
+                robust_resid = observed - robust_pred
+
+                poa_stats = reg_month[im].stats
+                ols_r2 = float(entry.stats[0]) if np.asarray(entry.stats).size >= 1 else np.nan
+                ols_mse = float(entry.stats[3]) if np.asarray(entry.stats).size >= 4 else np.nan
+                ols_rmse = float(np.sqrt(ols_mse)) if np.isfinite(ols_mse) else np.nan
+                robust_rmse = float(np.sqrt(np.nanmean(robust_resid ** 2))) if robust_resid.size else np.nan
+
+                for i in range(observed.shape[0]):
+                    rows.append({
+                        "WY": int(wy),
+                        "MonthNum": int(im + 1),
+                        "Month": self.mo_name[im] if im < len(self.mo_name) else str(im + 1),
+                        "Station": str(station_ids[i]),
+                        "ObservedYAdjInc": float(observed[i]),
+                        "OLSPredYAdjInc": float(ols_pred[i]) if np.isfinite(ols_pred[i]) else np.nan,
+                        "RobustPredYAdjInc": float(robust_pred[i]) if np.isfinite(robust_pred[i]) else np.nan,
+                        "OLSResidual": float(ols_resid[i]) if np.isfinite(ols_resid[i]) else np.nan,
+                        "RobustResidual": float(robust_resid[i]) if np.isfinite(robust_resid[i]) else np.nan,
+                        "POA_R2": float(1.0 - poa_stats.SSresid / poa_stats.SStotal) if poa_stats.SStotal != 0 else np.nan,
+                        "POA_RMSE": float(poa_stats.rmse),
+                        "WY_OLS_R2": ols_r2,
+                        "WY_OLS_RMSE": ols_rmse,
+                        "WY_Robust_RMSE": robust_rmse,
+                    })
+
+        out_path = diag_dir / f"RegressionObservedVsModeled_WY{wy1}_{wy1 + ny - 1}.csv"
+        pd.DataFrame(rows).to_csv(out_path, index=False)
+        self.log(f"Regression observed-vs-modeled CSV written: {out_path.name}\n")
+
+    def _save_regression_plots(
+        self,
+        reg_month: list[Any],
+        reg_hist: list[list[Any]],
+        wy1: int,
+        ny: int,
+    ) -> None:
+        try:
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            self.log(f"[Regression] Plot save skipped (matplotlib unavailable): {exc}\n")
+            return
+
+        m = self.ctx.modules
+        plot_dir = self.base_dir / self.hsr_key / "Output" / "Diagnostics" / "RegressionPlots"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+
+        # POA t-value heatmap (figure 58 from AFRegressPOA)
+        if plt.fignum_exists(58):
+            fig58 = plt.figure(58)
+            fig58.savefig(plot_dir / f"POA_TValues_WY{wy1}_{wy1 + ny - 1}.png", dpi=200, bbox_inches="tight")
+            plt.close(fig58)
+
+        # WY observed-vs-estimated subplots (figures 60+iy from AFRegressByWY)
+        for iy in range(ny):
+            fig_no = 60 + iy
+            if not plt.fignum_exists(fig_no):
+                continue
+            wy = wy1 + iy
+            fig = plt.figure(fig_no)
+            fig.savefig(plot_dir / f"ObservedVsEstimated_WY{wy}.png", dpi=200, bbox_inches="tight")
+            plt.close(fig)
+
+        # Coefficient plots for each month via AFPlotRegressCoeff (figure 82)
+        if "plotcoeff" in m:
+            for im in range(12):
+                m["plotcoeff"].plot_regress_coeff(
+                    reg_hist=reg_hist,
+                    reg_month=reg_month,
+                    reg_var_name=self.ctx.reg_var_name,
+                    month_name=self.month_name,
+                    im=im,
+                    hsr=self.hsr_key,
+                    wy1=wy1,
+                    wyn=wy1 + ny - 1,
+                    ny=ny,
+                )
+                if plt.fignum_exists(82):
+                    fig82 = plt.figure(82)
+                    mo = self.mo_name[im] if im < len(self.mo_name) else f"M{im + 1:02d}"
+                    fig82.savefig(plot_dir / f"RegressCoeff_{mo}_WY{wy1}_{wy1 + ny - 1}.png", dpi=200, bbox_inches="tight")
+                    plt.close(fig82)
+
+        self.log(f"Regression plots saved to: {plot_dir}\n")
 
     def step_estimate_incremental(self) -> ConvertedAFinchContext:
         if self.ctx.reg_poa is None or self.ctx.reg_hist is None:
