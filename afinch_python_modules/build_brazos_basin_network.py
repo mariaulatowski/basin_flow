@@ -1222,6 +1222,7 @@ def main() -> None:
 
     station_comid_path = flow_dir / "StationComID.csv"
     nhdflowline_path = flow_dir / "nhdflowline.txt"
+    nhdflowline_geom_path = flow_dir / "nhdflowline_geometry.gpkg"
     xwalk_path = flow_dir / "GridCodeComID.txt"
     vaa_path = gis_dir / "NHDFlowlineVAA.txt"
     nlcd_path = nlcd_dir / "catchmentattributesnlcd.txt"
@@ -1231,12 +1232,18 @@ def main() -> None:
     dat_path = sf_dir / f"ComIDStationDAMoAnQ{args.wy}.dat"
     da_path = sf_dir / "StationDASqMi.csv"
     catchment_gpkg = base_dir / "inputData" / f"NHDPlusCatchment_{args.ths}.gpkg"
+    flowline_gpkg = base_dir / "inputData" / f"NHDFlowline_{args.ths}.gpkg"
 
     if args.apply:
         for path in [station_comid_path, nhdflowline_path, xwalk_path, vaa_path, nlcd_path, precip_path, temp_path, wu_path, dat_path, da_path]:
             _backup(path, suffix=f".pre{args.ths}.bak")
 
     flow_tbl.to_csv(nhdflowline_path, index=False)
+    flow_export = flow_geom.copy()
+    keep_cols = [c for c in ["ComID", "ReachCode", "OrigReachCode", "LengthKm", "geometry"] if c in flow_export.columns]
+    flow_export = flow_export[keep_cols]
+    flow_export.to_file(nhdflowline_geom_path, driver="GPKG")
+    flow_export.to_file(flowline_gpkg, driver="GPKG")
     with xwalk_path.open("w", encoding="utf-8") as f:
         f.write("GridCode,ComID\n")
         pd.DataFrame({"GridCode": comids, "ComID": comids}).to_csv(f, index=False, header=False)

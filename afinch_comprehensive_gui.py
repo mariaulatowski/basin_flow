@@ -1144,15 +1144,15 @@ class AFinchComprehensiveGUI:
             out_shp = str(hsr_out / f"accumulated_flow_WY{wy}.shp")
             self.v_export_shp.set(out_shp)
 
-        self._log(f"\n=== STEP 7: EXPORT SHAPEFILE ===\n", "ok")
+        self._log(f"\n=== STEP 7: EXPORT SHAPEFILES (FLOWLINES + CATCHMENTS) ===\n", "ok")
         self._set_running(True)
 
         def worker():
             try:
-                self._do_export_shapefile(base, hsr_key, wy, months_to_export, Path(out_shp))
-                msg = f"Shapefile written:\n{out_shp}"
+                flowline_out, catchment_out = self._do_export_shapefile(base, hsr_key, wy, months_to_export, Path(out_shp))
+                msg = f"Shapefiles written:\n  Flowlines: {flowline_out}\n  Catchments: {catchment_out}"
                 self._log(f"✓ {msg}\n", "ok")
-                self.root.after(0, lambda: self._export_status.configure(text=f"✓ Written: {out_shp}"))
+                self.root.after(0, lambda: self._export_status.configure(text=f"✓ Written: flowlines + catchments for WY{wy}"))
             except Exception as exc:
                 err_text = str(exc)
                 self._log(f"ERROR: {err_text}\n", "err")
@@ -1167,12 +1167,22 @@ class AFinchComprehensiveGUI:
         try:
             import geopandas as gpd
             import pandas as pd
-            import numpy as np
         except ImportError as exc:
             raise RuntimeError(f"Missing package: {exc}.")
 
         ths = self.v_ths_code.get().strip()
         hsr_dir = base / hsr_key
+        catchment_gpkg = base / "inputData" / f"NHDPlusCatchment_{ths}.gpkg"
+        flowline_candidates = [
+            hsr_dir / "Flowlines" / "nhdflowline_geometry.gpkg",
+            base / "inputData" / f"NHDFlowline_{ths}.gpkg",
+        ]
+
+        # Derive two output paths from the user-provided base path.
+        base_stem = out_shp.stem
+        parent = out_shp.parent
+        flowline_out = parent / f"{base_stem}_flowlines.shp"
+        catchment_out = parent / f"{base_stem}_catchments.shp"
 
         # ── 1. Load accumulated flow data from HSR output ──────────────────────
         flow_file = hsr_dir / "Output" / "FlowAccum" / f"ComIDQ12WY{wy}.csv"
@@ -1235,57 +1245,6 @@ class AFinchComprehensiveGUI:
             mo = i + 1  # WY month 1=Oct … 12=Sep
             cfs_month_map[mo] = col
 
-        # ── 2. Load line geometry for modeled ComIDs (preferred) ───────────────
-        catchment_gpkg = base / "inputData" / f"NHDPlusCatchment_{ths}.gpkg"
-        line_candidates = [
-            hsr_dir / "Flowlines" / "nhdflowline_geometry.gpkg",
-            base / "inputData" / f"NHDFlowline_{ths}.gpkg",
-            base / "inputData" / "flowlines" / "Brazos_Flowline.shp",
-        ]
-
-        geom_gdf = None
-        for candidate in line_candidates:
-            if not candidate.exists():
-                continue
-            try:
-                probe = gpd.read_file(candidate, rows=5)
-            except Exception:
-                continue
-
-            if probe.empty:
-                continue
-
-            comid_field = next((c for c in ["ComID", "COMID", "NHDPlusID", "GridCode"] if c in probe.columns), None)
-            if comid_field is None:
-                continue
-
-            geom_types = set(probe.geometry.geom_type.dropna().unique().tolist())
-            if not (geom_types & {"LineString", "MultiLineString"}):
-                continue
-
-            self._log(f"Loading flowline geometry from {candidate}\n")
-            geom_gdf = gpd.read_file(candidate)
-            geom_gdf = geom_gdf.rename(columns={comid_field: "ComID"})
-            break
-
-        if geom_gdf is None:
-            if not catchment_gpkg.exists():
-                raise FileNotFoundError(
-                    "No flowline geometry source was found for shapefile export, and catchment fallback is missing.\n"
-                    f"Checked line sources: {', '.join(str(p) for p in line_candidates)}\n"
-                    f"Missing catchment fallback: {catchment_gpkg}"
-                )
-            self._log(
-                "WARNING: Flowline geometry not found; falling back to catchment polygons.\n"
-                f"Fallback geometry source: {catchment_gpkg}\n",
-                "warn",
-            )
-            geom_gdf = gpd.read_file(catchment_gpkg)
-            comid_field = "NHDPlusID" if "NHDPlusID" in geom_gdf.columns else geom_gdf.columns[0]
-            geom_gdf = geom_gdf.rename(columns={comid_field: "ComID"})
-
-        geom_gdf["ComID"] = pd.to_numeric(geom_gdf["ComID"], errors="coerce").astype("Int64")
-        geom_gdf = geom_gdf.dropna(subset=["ComID"])
         flow_df = flow_df.copy()
         flow_df["ModelComID"] = pd.to_numeric(flow_df[comid_col], errors="coerce").astype("Int64")
         flow_df = flow_df.dropna(subset=["ModelComID"])
@@ -1298,65 +1257,123 @@ class AFinchComprehensiveGUI:
                 .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
             )
 
-        modeled_comids = set(flow_df["ModelComID"].astype("int64").tolist())
-        before_filter = len(geom_gdf)
-        direct = geom_gdf[geom_gdf["ComID"].astype("int64").isin(modeled_comids)].copy()
-        join_mode = "comid"
+        def _build_joined_geodataframe(geom_gdf: pd.DataFrame, geom_label: str) -> gpd.GeoDataFrame:
+            geom_gdf = geom_gdf.copy()
+            geom_gdf["ComID"] = pd.to_numeric(geom_gdf["ComID"], errors="coerce").astype("Int64")
+            geom_gdf = geom_gdf.dropna(subset=["ComID"])
 
-        self._log(
-            f"ComID Matching Diagnostics:\n"
-            f"  Modeled ComIDs: {len(modeled_comids)} unique (range: {min(modeled_comids)} to {max(modeled_comids)})\n"
-            f"  Geometry ComIDs: {len(set(geom_gdf['ComID'].dropna().tolist()))} unique (range: {geom_gdf['ComID'].min()} to {geom_gdf['ComID'].max()})\n"
-            f"  Direct match found: {len(direct)} of {before_filter} geometries\n",
-            "info"
-        )
+            modeled_comids = set(flow_df["ModelComID"].astype("int64").tolist())
+            before_filter = len(geom_gdf)
+            direct = geom_gdf[geom_gdf["ComID"].astype("int64").isin(modeled_comids)].copy()
+            join_mode = "comid"
 
-        if direct.empty:
-            if not catchment_gpkg.exists():
-                raise RuntimeError(
-                    "No matching ComIDs between modeled flow output and selected geometry source, "
-                    "and no catchment crosswalk file is available for ReachCode fallback."
-                )
-
-            crosswalk = gpd.read_file(catchment_gpkg, columns=["NHDPlusID", "OrigReachCode"])
-            crosswalk = crosswalk.rename(columns={"NHDPlusID": "ModelComID"})
-            crosswalk["ModelComID"] = pd.to_numeric(crosswalk["ModelComID"], errors="coerce").astype("Int64")
-            crosswalk["OrigReachCode"] = _norm_reach(crosswalk["OrigReachCode"])
-            crosswalk = crosswalk.dropna(subset=["ModelComID", "OrigReachCode"]).drop_duplicates(subset=["ModelComID"])
-
-            flow_df = flow_df.merge(crosswalk[["ModelComID", "OrigReachCode"]], on="ModelComID", how="left")
-            flow_df["JoinKey"] = _norm_reach(flow_df["OrigReachCode"])
-            flow_df = flow_df.dropna(subset=["JoinKey"])
-
-            geom_reach_col = "REACHCODE" if "REACHCODE" in geom_gdf.columns else (
-                "ReachCode" if "ReachCode" in geom_gdf.columns else (
-                    "OrigReachCode" if "OrigReachCode" in geom_gdf.columns else None
-                )
+            self._log(
+                f"ComID Matching Diagnostics ({geom_label}):\n"
+                f"  Modeled ComIDs: {len(modeled_comids)} unique (range: {min(modeled_comids)} to {max(modeled_comids)})\n"
+                f"  Geometry ComIDs: {len(set(geom_gdf['ComID'].dropna().tolist()))} unique (range: {geom_gdf['ComID'].min()} to {geom_gdf['ComID'].max()})\n"
+                f"  Direct match found: {len(direct)} of {before_filter} geometries\n",
+                "info"
             )
-            if geom_reach_col is None:
-                raise RuntimeError(
-                    "No matching ComIDs between modeled flow output and geometry source, and geometry has "
-                    "no ReachCode field for fallback join."
+
+            flow_join = flow_df.copy()
+            if direct.empty:
+                geom_reach_col = "REACHCODE" if "REACHCODE" in geom_gdf.columns else (
+                    "ReachCode" if "ReachCode" in geom_gdf.columns else (
+                        "OrigReachCode" if "OrigReachCode" in geom_gdf.columns else None
+                    )
                 )
+                if geom_reach_col is None:
+                    raise RuntimeError(
+                        f"No matching ComIDs for {geom_label}, and geometry has no ReachCode field for fallback join."
+                    )
 
-            geom_gdf["JoinKey"] = _norm_reach(geom_gdf[geom_reach_col])
-            geom_gdf = geom_gdf.dropna(subset=["JoinKey"])
-            matched_keys = set(flow_df["JoinKey"].tolist())
-            direct = geom_gdf[geom_gdf["JoinKey"].isin(matched_keys)].copy()
-            join_mode = "reachcode"
-            self._log("ComID direct match failed; using modeled ComID -> OrigReachCode flowline join.\n", "warn")
-        else:
-            flow_df["JoinKey"] = flow_df["ModelComID"].astype("int64").astype(str)
-            direct["JoinKey"] = direct["ComID"].astype("int64").astype(str)
+                crosswalk = None
+                hsr_flowline_txt = hsr_dir / "Flowlines" / "nhdflowline.txt"
+                if hsr_flowline_txt.exists():
+                    try:
+                        hsr_xw = pd.read_csv(hsr_flowline_txt)
+                        if {"ComID", "ReachCode"}.issubset(set(hsr_xw.columns)):
+                            crosswalk = hsr_xw[["ComID", "ReachCode"]].rename(
+                                columns={"ComID": "ModelComID", "ReachCode": "OrigReachCode"}
+                            )
+                    except Exception:
+                        crosswalk = None
 
-        geom_gdf = direct
-        if geom_gdf.empty:
-            raise RuntimeError("No matching reaches between modeled flow output and geometry source.")
-        if len(geom_gdf) < before_filter:
-            self._log(f"Filtered geometry to modeled reaches: {len(geom_gdf):,} of {before_filter:,}\n")
+                if crosswalk is None:
+                    if not catchment_gpkg.exists():
+                        raise RuntimeError(
+                            f"No matching ComIDs for {geom_label}, and no crosswalk file is available for ReachCode fallback."
+                        )
+                    crosswalk = gpd.read_file(catchment_gpkg, columns=["NHDPlusID", "OrigReachCode"]).rename(
+                        columns={"NHDPlusID": "ModelComID"}
+                    )
 
-        # ── 3. Join flow data to geometry ──────────────────────────────────────
-        self._log(f"Joining flow data to {len(geom_gdf)} geometries…\n")
+                crosswalk["ModelComID"] = pd.to_numeric(crosswalk["ModelComID"], errors="coerce").astype("Int64")
+                crosswalk["OrigReachCode"] = _norm_reach(crosswalk["OrigReachCode"])
+                crosswalk = crosswalk.dropna(subset=["ModelComID", "OrigReachCode"]).drop_duplicates(subset=["ModelComID"])
+
+                flow_join = flow_join.merge(crosswalk[["ModelComID", "OrigReachCode"]], on="ModelComID", how="left")
+                flow_join["JoinKey"] = _norm_reach(flow_join["OrigReachCode"])
+                flow_join = flow_join.dropna(subset=["JoinKey"])
+
+                geom_gdf["JoinKey"] = _norm_reach(geom_gdf[geom_reach_col])
+                geom_gdf = geom_gdf.dropna(subset=["JoinKey"])
+                matched_keys = set(flow_join["JoinKey"].tolist())
+                direct = geom_gdf[geom_gdf["JoinKey"].isin(matched_keys)].copy()
+                join_mode = "reachcode"
+                self._log(f"ComID direct match failed for {geom_label}; using modeled ComID -> ReachCode crosswalk join.\n", "warn")
+            else:
+                flow_join["JoinKey"] = flow_join["ModelComID"].astype("int64").astype(str)
+                direct["JoinKey"] = direct["ComID"].astype("int64").astype(str)
+
+            if direct.empty:
+                raise RuntimeError(f"No matching reaches between modeled flow output and {geom_label} geometry source.")
+            if len(direct) < before_filter:
+                self._log(f"Filtered {geom_label} geometry to modeled reaches: {len(direct):,} of {before_filter:,}\n")
+
+            self._log(f"Joining flow data to {len(direct)} {geom_label} geometries…\n")
+
+            out_df = direct[["ComID", "geometry", "JoinKey"]].copy()
+            out_df["ComID"] = out_df["ComID"].astype("int64")
+            if join_mode == "reachcode":
+                out_df = out_df.rename(columns={"ComID": "NHDCOMID"})
+                reach_to_model = (
+                    flow_join[["JoinKey", "ModelComID"]]
+                    .dropna()
+                    .drop_duplicates(subset=["JoinKey"])
+                    .rename(columns={"ModelComID": "COMID"})
+                )
+                out_df = out_df.merge(reach_to_model, on="JoinKey", how="left")
+                out_df["COMID"] = pd.to_numeric(out_df["COMID"], errors="coerce").astype("Int64")
+            else:
+                out_df = out_df.rename(columns={"ComID": "COMID"})
+
+            for mo in months:
+                if mo not in cfs_month_map:
+                    self._log(f"  ⚠ WY Month {mo} not found in flow data, skipping.\n", "warn")
+                    continue
+                src_col = cfs_month_map[mo]
+                mo_label = WY_MONTH_NAMES.get(mo, f"M{mo:02d}")
+                col_name = f"{wy}_{mo_label}_CFS"[:10]
+                mo_data = flow_join[["JoinKey", src_col]].rename(columns={src_col: col_name})
+                out_df = out_df.merge(mo_data, on="JoinKey", how="left")
+
+            cfs_cols = [c for c in out_df.columns if "CFS" in c]
+            if cfs_cols:
+                non_null_counts = out_df[cfs_cols].notna().sum()
+                nan_pct = (1 - non_null_counts / len(out_df)) * 100
+                for col, pct in zip(cfs_cols, nan_pct):
+                    if pct > 50:
+                        self._log(
+                            f"⚠ WARNING ({geom_label}): {col} is {pct:.1f}% NaN. Join may have failed.\n",
+                            "warn"
+                        )
+
+            out_df = out_df.drop(columns=["JoinKey"])
+            out_gdf = gpd.GeoDataFrame(out_df, geometry="geometry", crs=direct.crs)
+            if out_gdf.crs is not None and not out_gdf.crs.is_geographic:
+                out_gdf = out_gdf.to_crs("EPSG:4326")
+            return out_gdf
 
         # WY month → calendar month label mapping (Oct=1 → Oct, …, Sep=12 → Sep)
         WY_MONTH_NAMES = {
@@ -1366,63 +1383,71 @@ class AFinchComprehensiveGUI:
             10: "Jul", 11: "Aug", 12: "Sep",
         }
 
-        out_df = geom_gdf[["ComID", "geometry", "JoinKey"]].copy()
-        out_df["ComID"] = out_df["ComID"].astype("int64")
-        if join_mode == "reachcode":
-            out_df = out_df.rename(columns={"ComID": "NHDCOMID"})
-            reach_to_model = (
-                flow_df[["JoinKey", "ModelComID"]]
-                .dropna()
-                .drop_duplicates(subset=["JoinKey"])
-                .rename(columns={"ModelComID": "COMID"})
-            )
-            out_df = out_df.merge(reach_to_model, on="JoinKey", how="left")
-            out_df["COMID"] = pd.to_numeric(out_df["COMID"], errors="coerce").astype("Int64")
-        else:
-            out_df = out_df.rename(columns={"ComID": "COMID"})
-
-        for mo in months:
-            if mo not in cfs_month_map:
-                self._log(f"  ⚠ WY Month {mo} not found in flow data, skipping.\n", "warn")
+        # Build and write flowline output (ArcMap style: NHDFlowline + ComIDQ12yyyy join)
+        flowline_geom = None
+        for candidate in flowline_candidates:
+            if not candidate.exists():
                 continue
-            src_col = cfs_month_map[mo]
-            mo_label = WY_MONTH_NAMES.get(mo, f"M{mo:02d}")
-            col_name = f"{wy}_{mo_label}_CFS"[:10]  # shapefile field limit 10 chars
+            try:
+                probe = gpd.read_file(candidate, rows=5)
+            except Exception:
+                continue
+            if probe.empty:
+                continue
+            comid_field = next((c for c in ["ComID", "COMID", "NHDPlusID", "GridCode"] if c in probe.columns), None)
+            if comid_field is None:
+                continue
+            geom_types = set(probe.geometry.geom_type.dropna().unique().tolist())
+            if not (geom_types & {"LineString", "MultiLineString"}):
+                continue
+            self._log(f"Loading flowline geometry from {candidate}\n")
+            flowline_geom = gpd.read_file(candidate).rename(columns={comid_field: "ComID"})
+            break
 
-            mo_data = flow_df[["JoinKey", src_col]].rename(columns={src_col: col_name})
-            out_df = out_df.merge(mo_data, on="JoinKey", how="left")
+        if flowline_geom is None:
+            raise FileNotFoundError(
+                "No NHD flowline geometry source found for flowline export. "
+                f"Checked: {', '.join(str(p) for p in flowline_candidates)}. "
+                "Run Build Network with updated exporter to generate flowline geometry, "
+                "or place inputData/NHDFlowline_<THS>.gpkg in inputData."
+            )
 
-        # ── Validate that flow data merged successfully ────────────────────────
-        cfs_cols = [c for c in out_df.columns if "CFS" in c]
-        if cfs_cols:
-            non_null_counts = out_df[cfs_cols].notna().sum()
-            nan_pct = (1 - non_null_counts / len(out_df)) * 100
-            for col, pct in zip(cfs_cols, nan_pct):
-                if pct > 50:
-                    self._log(
-                        f"⚠ WARNING: {col} is {pct:.1f}% NaN. ComID merge may have failed.\n"
-                        f"  Geometry ComID range: {out_df['COMID'].min()} to {out_df['COMID'].max()}\n"
-                        f"  Flow data ComID range: {flow_df[comid_col].min()} to {flow_df[comid_col].max()}\n",
-                        "warn"
-                    )
+        flowline_gdf = _build_joined_geodataframe(flowline_geom, "flowline")
 
-        out_df = out_df.drop(columns=["JoinKey"])
-        out_gdf = gpd.GeoDataFrame(out_df, geometry="geometry", crs=geom_gdf.crs)
-
-        # Reproject to standard geographic CRS for ArcGIS compatibility
-        if out_gdf.crs is not None and not out_gdf.crs.is_geographic:
-            out_gdf = out_gdf.to_crs("EPSG:4326")
-
-        # ── 4. Write shapefile ─────────────────────────────────────────────────
-        out_shp.parent.mkdir(parents=True, exist_ok=True)
-        self._log(f"Writing shapefile: {out_shp}\n")
-        out_gdf.to_file(str(out_shp), driver="ESRI Shapefile")
-        n_rows = len(out_gdf)
-        n_mo = len([c for c in out_gdf.columns if "CFS" in c])
-        self._log(
-            f"Done. {n_rows:,} reaches, {n_mo} month column(s). "
-            f"File: {out_shp}\n"
+        # Build and write catchment polygon output
+        if not catchment_gpkg.exists():
+            raise FileNotFoundError(
+                f"Catchment geometry file not found: {catchment_gpkg}. "
+                "Run Build Network first to generate NHDPlus catchment geometry."
+            )
+        self._log(f"Loading catchment geometry from {catchment_gpkg}\n")
+        catch_geom = gpd.read_file(catchment_gpkg)
+        catch_comid_field = "NHDPlusID" if "NHDPlusID" in catch_geom.columns else (
+            "ComID" if "ComID" in catch_geom.columns else (
+                "COMID" if "COMID" in catch_geom.columns else catch_geom.columns[0]
+            )
         )
+        catch_geom = catch_geom.rename(columns={catch_comid_field: "ComID"})
+        catchment_gdf = _build_joined_geodataframe(catch_geom, "catchment")
+
+        # Write both outputs
+        out_shp.parent.mkdir(parents=True, exist_ok=True)
+
+        self._log(f"Writing flowline shapefile: {flowline_out}\n")
+        flowline_gdf.to_file(str(flowline_out), driver="ESRI Shapefile")
+        self._log(
+            f"Done flowlines. {len(flowline_gdf):,} features, "
+            f"{len([c for c in flowline_gdf.columns if 'CFS' in c])} month column(s).\n"
+        )
+
+        self._log(f"Writing catchment shapefile: {catchment_out}\n")
+        catchment_gdf.to_file(str(catchment_out), driver="ESRI Shapefile")
+        self._log(
+            f"Done catchments. {len(catchment_gdf):,} features, "
+            f"{len([c for c in catchment_gdf.columns if 'CFS' in c])} month column(s).\n"
+        )
+
+        return flowline_out, catchment_out
 
     # ── Logging ──────────────────────────────────────────────────────────────
 
