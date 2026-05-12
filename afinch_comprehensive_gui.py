@@ -1303,6 +1303,14 @@ class AFinchComprehensiveGUI:
         direct = geom_gdf[geom_gdf["ComID"].astype("int64").isin(modeled_comids)].copy()
         join_mode = "comid"
 
+        self._log(
+            f"ComID Matching Diagnostics:\n"
+            f"  Modeled ComIDs: {len(modeled_comids)} unique (range: {min(modeled_comids)} to {max(modeled_comids)})\n"
+            f"  Geometry ComIDs: {len(set(geom_gdf['ComID'].dropna().tolist()))} unique (range: {geom_gdf['ComID'].min()} to {geom_gdf['ComID'].max()})\n"
+            f"  Direct match found: {len(direct)} of {before_filter} geometries\n",
+            "info"
+        )
+
         if direct.empty:
             if not catchment_gpkg.exists():
                 raise RuntimeError(
