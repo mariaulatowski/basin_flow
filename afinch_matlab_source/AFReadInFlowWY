@@ -67,7 +67,9 @@ def read_in_flow_wy(
     """
     print("\nAFReadInFlowWY: Reading in flows at gaging stations and water-use flows at specified reaches.")
 
-    flow_file = base_dir / f"HSR{ths[:2]}00" / "Streamflow" / f"ComIDStationDAMoAnQ{wy}.dat"
+    # Use the active HSR folder (for example HSR1209) so station IDs align with
+    # the selected subregion StationList and gaged-catchment files.
+    flow_file = base_dir / hsr / "Streamflow" / f"ComIDStationDAMoAnQ{wy}.dat"
     if not flow_file.exists():
         raise FileNotFoundError(f"Missing streamflow file: {flow_file}")
 
