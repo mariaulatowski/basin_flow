@@ -86,4 +86,10 @@ def q_est_adj_inc(
 				y_est_adj_inc[iy, :, im] * area_sq_mi * _INCHES_TO_CFS / dim[im]
 			)
 
+	# Enforce non-negativity constraint on estimated incremental flows.
+	# Regression models can produce negative predictions; clipping at zero
+	# prevents negative flows from propagating through constraint and accumulation stages.
+	y_est_adj_inc = np.maximum(y_est_adj_inc, 0.0)
+	q_est_adj_inc = np.maximum(q_est_adj_inc, 0.0)
+
 	return y_est_adj_inc, q_est_adj_inc
