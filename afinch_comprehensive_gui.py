@@ -162,7 +162,8 @@ class AFinchComprehensiveGUI:
         self.v_nlcd_raster     = tk.StringVar()
         self.v_prism_ppt_dir   = tk.StringVar()
         self.v_prism_tmean_dir = tk.StringVar()
-        self.v_build_wy        = tk.StringVar(value="2018")
+        self.v_build_wy_start  = tk.StringVar(value="2018")
+        self.v_build_wy_end    = tk.StringVar(value="2018")
 
         # Run Model
         self.v_run_wy_start    = tk.StringVar(value="2018")
@@ -356,13 +357,15 @@ class AFinchComprehensiveGUI:
                   font=SMALL_FONT, bg=ACCENT, fg="white", relief="flat", padx=6
                   ).grid(row=3, column=1, sticky="w", pady=(4, 0))
 
-        s3 = Section(outer, "Water Year to Sample PRISM for Network Build")
+        s3 = Section(outer, "Water Years to Build Network For")
         s3.pack(fill="x", padx=6, pady=(6, 8))
         row_wy = tk.Frame(s3, bg=PANEL)
         row_wy.pack(fill="x")
-        tk.Label(row_wy, text="Water Year:", font=LABEL_FONT, bg=PANEL).pack(side="left", padx=(0, 6))
-        tk.Entry(row_wy, textvariable=self.v_build_wy, width=8, font=ENTRY_FONT).pack(side="left")
-        tk.Label(row_wy, text="   Used only for the Build Network step. Each modeled year uses that year's own PRISM data.",
+        tk.Label(row_wy, text="Start WY:", font=LABEL_FONT, bg=PANEL).pack(side="left", padx=(0, 6))
+        tk.Entry(row_wy, textvariable=self.v_build_wy_start, width=8, font=ENTRY_FONT).pack(side="left")
+        tk.Label(row_wy, text="End WY:", font=LABEL_FONT, bg=PANEL).pack(side="left", padx=(12, 6))
+        tk.Entry(row_wy, textvariable=self.v_build_wy_end, width=8, font=ENTRY_FONT).pack(side="left")
+        tk.Label(row_wy, text="   (Build will generate all years in range; each year gets its own PRISM data.)",
                  font=SMALL_FONT, fg="#666", bg=PANEL).pack(side="left", padx=8)
         tk.Label(
             s3,
@@ -707,44 +710,51 @@ class AFinchComprehensiveGUI:
         if not builder_path.exists():
             raise FileNotFoundError(f"Builder script not found:\n{builder_path}")
 
-        cmd = [
-            sys.executable, str(builder_path),
-            "--base-dir",   str(base),
-            "--ths",        cfg["ths"],
-            "--hsr",        cfg["hsr"],
-            "--gdb-root",   cfg["nhd_rel"],
-            "--wy",         str(cfg["build_wy"]),
-            "--nlcd-raster", cfg["nlcd_rel"],
-            "--prism-ppt-dir",   cfg["prism_ppt_rel"],
-            "--prism-tmean-dir", cfg["prism_tmean_rel"],
-        ]
-        if cfg.get("basin_shp_rel"):
-            cmd += [
-                "--basin-shp", cfg["basin_shp_rel"],
-                "--basin-field", cfg["basin_field"],
-                "--basin-value", cfg["basin_value"],
+        build_years = list(range(cfg["build_wy_start"], cfg["build_wy_end"] + 1))
+        self._log(f"Building network for years: {build_years}\n")
+        
+        for wy in build_years:
+            self._log(f"\n--- Building streamflow files for WY{wy} ---\n")
+            cmd = [
+                sys.executable, str(builder_path),
+                "--base-dir",   str(base),
+                "--ths",        cfg["ths"],
+                "--hsr",        cfg["hsr"],
+                "--gdb-root",   cfg["nhd_rel"],
+                "--wy",         str(wy),
+                "--nlcd-raster", cfg["nlcd_rel"],
+                "--prism-ppt-dir",   cfg["prism_ppt_rel"],
+                "--prism-tmean-dir", cfg["prism_tmean_rel"],
             ]
-        if cfg.get("hu4s"):
-            cmd += ["--hu4s", cfg["hu4s"]]
-        if cfg.get("gages_csv"):
-            cmd += ["--gages-csv", cfg["gages_csv"]]
-        if cfg.get("wam_csv"):
-            cmd += ["--wam-csv", cfg["wam_csv"]]
-        if not dry_run:
-            cmd.append("--apply")
+            if cfg.get("basin_shp_rel"):
+                cmd += [
+                    "--basin-shp", cfg["basin_shp_rel"],
+                    "--basin-field", cfg["basin_field"],
+                    "--basin-value", cfg["basin_value"],
+                ]
+            if cfg.get("hu4s"):
+                cmd += ["--hu4s", cfg["hu4s"]]
+            if cfg.get("gages_csv"):
+                cmd += ["--gages-csv", cfg["gages_csv"]]
+            if cfg.get("wam_csv"):
+                cmd += ["--wam-csv", cfg["wam_csv"]]
+            if not dry_run:
+                cmd.append("--apply")
 
-        self._log(f"Command:\n  {' '.join(cmd)}\n")
-        proc = subprocess.Popen(
-            cmd, cwd=str(base),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            self._log(line)
-        rc = proc.wait()
-        if rc != 0:
-            raise RuntimeError(f"Builder exited with code {rc}")
+            self._log(f"Command:\n  {' '.join(cmd)}\n")
+            proc = subprocess.Popen(
+                cmd, cwd=str(base),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                self._log(line)
+            rc = proc.wait()
+            if rc != 0:
+                raise RuntimeError(f"Builder exited with code {rc} for WY{wy}")
+        
+        self._log(f"\nAll years {build_years} built successfully.\n")
 
     def _do_build_upstream_gaged(self, cfg: dict):
         """Generate upstream contributing catchments for USGS gages from VAA topology."""
@@ -885,6 +895,11 @@ class AFinchComprehensiveGUI:
                 raise ValueError(f"Invalid HU4 code(s): {', '.join(bad)}. Use 4-digit values like 1206.")
             hu4s = ",".join(hu4_parts)
 
+        build_wy_start = int(self.v_build_wy_start.get().strip())
+        build_wy_end   = int(self.v_build_wy_end.get().strip())
+        if build_wy_end < build_wy_start:
+            raise ValueError("Build End WY must be ≥ Build Start WY")
+        
         return {
             "base_dir":       base,
             "ths":            self.v_ths_code.get().strip(),
@@ -897,7 +912,8 @@ class AFinchComprehensiveGUI:
             "nlcd_rel":       rel(nlcd),
             "prism_ppt_rel":  rel(ppt),
             "prism_tmean_rel": rel(tmean),
-            "build_wy":       int(self.v_build_wy.get().strip()),
+            "build_wy_start": build_wy_start,
+            "build_wy_end":   build_wy_end,
             "gages_csv":      self.v_gages_csv.get().strip(),
             "wam_csv":        "NONE" if self.v_usgs_only.get() else self.v_wam_csv.get().strip(),
         }

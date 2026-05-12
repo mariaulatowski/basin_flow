@@ -567,18 +567,50 @@ class ConvertedAFinchPipeline:
             self._temp_res_reg = self.ctx.temp_res
             return
 
+        # Auto-detect available streamflow files and adjust regression year range
+        requested_start = self.wy1_reg
+        requested_end = self.wy1_reg + self.ny_reg - 1
+        hsr_streamflow_dir = self.base_dir / self.hsr_key / "Streamflow"
+        
+        available_years = []
+        if hsr_streamflow_dir.exists():
+            for f in hsr_streamflow_dir.glob("ComIDStationDAMoAnQ*.dat"):
+                try:
+                    wy = int(f.stem.replace("ComIDStationDAMoAnQ", ""))
+                    available_years.append(wy)
+                except ValueError:
+                    pass
+            available_years.sort()
+        
+        # Filter to requested range
+        available_in_range = [wy for wy in available_years if requested_start <= wy <= requested_end]
+        
+        if not available_in_range:
+            raise FileNotFoundError(
+                f"No streamflow files found in {hsr_streamflow_dir} for requested range WY{requested_start}-{requested_end}. "
+                f"Available years: {available_years if available_years else 'none'}. "
+                f"Run Build Network to generate missing years."
+            )
+        
+        # Use available years instead of all requested years
+        if available_in_range != list(range(requested_start, requested_end + 1)):
+            self.log(f"[Regression] Requested WY{requested_start}-{requested_end}, but only found: {available_in_range}\n")
+            self.log(f"[Regression] Using these years for regression.\n")
+            self.wy1_reg = available_in_range[0]
+            self.ny_reg = len(available_in_range)
+        
         # Ensure yearly HSR PRISM dat files exist for all regression years.
         self._ensure_regression_prism_files()
 
-        self.log(f"[Regression] Loading multi-year data for WY{self.wy1_reg}-{self.wy1_reg + self.ny_reg - 1}...\n")
+        years_for_regression = list(range(self.wy1_reg, self.wy1_reg + self.ny_reg))
+        self.log(f"[Regression] Loading multi-year data for years: {years_for_regression}\n")
         m = self.ctx.modules
         p_cols = [f"PIn_{i:02d}" for i in range(1, 13)]
 
         # Load PRISM for all regression years
         prism_list = []
         p_in_list = []
-        for iy in range(self.ny_reg):
-            wy_reg = self.wy1_reg + iy
+        for wy_reg in years_for_regression:
             prism = m["prec"].read_prism_prec(
                 base_dir=self.base_dir,
                 ths=self.ths,
@@ -598,9 +630,8 @@ class ConvertedAFinchPipeline:
         self._sta_hist_list_reg = []
         temp_res_list = []
         afstruct_years: list[Any] = []
-        for iy in range(self.ny_reg):
-            wy_reg = self.wy1_reg + iy
-            prism = prism_list[iy]
+        for wy_reg in years_for_regression:
+            prism = prism_list[years_for_regression.index(wy_reg)]
             setup_ctx = m["setup"].setup_data(wy1=wy_reg, iy=0, ths=self.ths)
             days_in_mo_reg = np.asarray(setup_ctx.days_in_mo, dtype=float)
 
