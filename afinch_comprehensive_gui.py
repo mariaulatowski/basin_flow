@@ -167,6 +167,8 @@ class AFinchComprehensiveGUI:
         # Run Model
         self.v_run_wy_start    = tk.StringVar(value="2018")
         self.v_run_wy_end      = tk.StringVar(value="2018")
+        self.v_reg_wy_start    = tk.StringVar(value="2018")  # Regression calibration start
+        self.v_reg_ny          = tk.StringVar(value="15")     # Regression calibration years
 
         # Export
         self.v_export_wy       = tk.StringVar(value="2018")
@@ -435,6 +437,18 @@ class AFinchComprehensiveGUI:
         tk.Label(wy_row, text="End WY:", font=LABEL_FONT, bg=PANEL).pack(side="left", padx=(0, 4))
         tk.Entry(wy_row, textvariable=self.v_run_wy_end, width=8, font=ENTRY_FONT).pack(side="left")
         tk.Label(wy_row, text="   (single year: set both the same)",
+                 font=SMALL_FONT, fg="#666", bg=PANEL).pack(side="left", padx=8)
+
+        # Regression calibration years
+        s_reg = Section(outer, "Regression Calibration (Step 2)")
+        s_reg.pack(fill="x", padx=6, pady=(8, 0))
+        reg_row = tk.Frame(s_reg, bg=PANEL)
+        reg_row.pack(fill="x")
+        tk.Label(reg_row, text="Start WY:", font=LABEL_FONT, bg=PANEL).pack(side="left", padx=(0, 4))
+        tk.Entry(reg_row, textvariable=self.v_reg_wy_start, width=8, font=ENTRY_FONT).pack(side="left", padx=(0, 16))
+        tk.Label(reg_row, text="# Years:", font=LABEL_FONT, bg=PANEL).pack(side="left", padx=(0, 4))
+        tk.Entry(reg_row, textvariable=self.v_reg_ny, width=8, font=ENTRY_FONT).pack(side="left")
+        tk.Label(reg_row, text="   (e.g., start=2004, years=15 → WY2004-2018)",
                  font=SMALL_FONT, fg="#666", bg=PANEL).pack(side="left", padx=8)
 
         # Full run button
@@ -938,10 +952,15 @@ class AFinchComprehensiveGUI:
 
         self._log(f"Loading pipeline from: {runner}\n")
         mod = self._load_module("afinch_gui_runner", runner)
-        # Use pipeline defaults for regression calibration years (typically multi-year),
-        # then fall back to the modeled run window if defaults are unavailable.
-        reg_wy_start = int(getattr(mod, "WY1_REG", cfg["wy_start"]))
-        reg_ny = int(getattr(mod, "NY_REG", cfg["ny"]))
+        # Use GUI-specified regression calibration years (or defaults if parsing fails).
+        try:
+            reg_wy_start = int(self.v_reg_wy_start.get().strip())
+            reg_ny = int(self.v_reg_ny.get().strip())
+        except (ValueError, AttributeError):
+            # Fallback: use pipeline defaults for regression calibration years (typically multi-year),
+            # then fall back to the modeled run window if defaults are unavailable.
+            reg_wy_start = int(getattr(mod, "WY1_REG", cfg["wy_start"]))
+            reg_ny = int(getattr(mod, "NY_REG", cfg["ny"]))
         self._pipeline = mod.ConvertedAFinchPipeline(
             base_dir=cfg["base_dir"],
             src_dir=cfg["base_dir"] / "afinch_matlab_source",
@@ -955,7 +974,7 @@ class AFinchComprehensiveGUI:
         )
         self._log(
             f"Regression window: WY{reg_wy_start}-{reg_wy_start + reg_ny - 1} "
-            f"(pipeline default calibration window)\n"
+            f"(GUI-specified calibration window)\n"
         )
         self._pipeline_sig = sig
         self._completed_steps.clear()
