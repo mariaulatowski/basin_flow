@@ -108,6 +108,14 @@ def _parse_args() -> argparse.Namespace:
             "(Brazos default), or skipped silently if that file doesn't exist."
         ),
     )
+    parser.add_argument(
+        "--annual-only",
+        action="store_true",
+        help=(
+            "Rebuild only year-varying artifacts (PRISM yearly files and Streamflow dat) "
+            "using previously built static network files."
+        ),
+    )
     parser.add_argument("--apply", action="store_true", help="Apply updates into HSR files (writes backups)")
     return parser.parse_args()
 
@@ -1178,6 +1186,110 @@ def main() -> None:
     base_dir = Path(args.base_dir).resolve()
     hsr_dir = base_dir / args.hsr
 
+    # Common output paths used by both full and annual-only modes.
+    flow_dir = hsr_dir / "Flowlines"
+    gis_dir = hsr_dir / "GIS"
+    nlcd_dir = hsr_dir / "NLCD"
+    p_dir = hsr_dir / "PRISM" / "Precipitation"
+    t_dir = hsr_dir / "PRISM" / "Temperature"
+    wu_dir = hsr_dir / "WaterUse"
+    sf_dir = hsr_dir / "Streamflow"
+    gaged_dir = hsr_dir / "GagedCatchments"
+    for d in [flow_dir, gis_dir, nlcd_dir, p_dir, t_dir, wu_dir, sf_dir, gaged_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    station_comid_path = flow_dir / "StationComID.csv"
+    nhdflowline_path = flow_dir / "nhdflowline.txt"
+    nhdflowline_geom_path = flow_dir / "nhdflowline_geometry.gpkg"
+    xwalk_path = flow_dir / "GridCodeComID.txt"
+    vaa_path = gis_dir / "NHDFlowlineVAA.txt"
+    nlcd_path = nlcd_dir / "catchmentattributesnlcd.txt"
+    precip_path = p_dir / f"PrismPrecipWY{args.wy}.dat"
+    temp_path = t_dir / f"PrismTempAveWY{args.wy}.dat"
+    wu_path = wu_dir / "ComID_WU_All.dat"
+    dat_path = sf_dir / f"ComIDStationDAMoAnQ{args.wy}.dat"
+    da_path = sf_dir / "StationDASqMi.csv"
+    catchment_gpkg = base_dir / "inputData" / f"NHDPlusCatchment_{args.ths}.gpkg"
+    flowline_gpkg = base_dir / "inputData" / f"NHDFlowline_{args.ths}.gpkg"
+
+    if args.annual_only:
+        print(f"Running annual-only update for WY{args.wy} (static network files reused).")
+
+        if not catchment_gpkg.exists():
+            raise FileNotFoundError(
+                f"Missing catchment geometry: {catchment_gpkg}. Run full Build Network once before annual-only mode."
+            )
+        if not station_comid_path.exists():
+            raise FileNotFoundError(
+                f"Missing station map: {station_comid_path}. Run full Build Network once before annual-only mode."
+            )
+
+        # Prepare catchment geometry used for zonal PRISM sampling.
+        catch_geom = gpd.read_file(catchment_gpkg)
+        comid_col = next((c for c in ["NHDPlusID", "ComID", "COMID", "GridCode"] if c in catch_geom.columns), None)
+        if comid_col is None:
+            raise KeyError(
+                f"No ComID-like field in {catchment_gpkg}. Columns: {list(catch_geom.columns)}"
+            )
+        catch_geom = catch_geom.rename(columns={comid_col: "ComID"}).copy()
+        catch_geom["ComID"] = pd.to_numeric(catch_geom["ComID"], errors="coerce").astype("Int64")
+        catch_geom = catch_geom.dropna(subset=["ComID", "geometry"]).copy()
+        catch_geom["ComID"] = catch_geom["ComID"].astype("int64")
+
+        # Keep only columns required by builders.
+        geom_cols = ["ComID", "geometry"]
+        if "AreaSqKm" in catch_geom.columns:
+            geom_cols.insert(1, "AreaSqKm")
+        catch_geom = catch_geom[geom_cols].copy()
+
+        # Build yearly PRISM files.
+        if not args.apply:
+            print("Dry run (annual-only): validated static prerequisites and yearly output paths.")
+            return
+
+        _backup(precip_path, suffix=f".pre{args.ths}.bak")
+        _backup(temp_path, suffix=f".pre{args.ths}.bak")
+        _backup(dat_path, suffix=f".pre{args.ths}.bak")
+        _backup(da_path, suffix=f".pre{args.ths}.bak")
+
+        precip_df, temp_df = _build_catchment_prism(base_dir, catch_geom, args.wy, args.prism_ppt_dir, args.prism_tmean_dir)
+        with precip_path.open("w", encoding="utf-8") as f:
+            f.write("PRISM precipitation\n")
+            f.write("Real basin catchment-zonal dataset\n")
+            f.write("GridCode GCAreaSqMi PIn_01..PIn_13\n")
+            f.write("Units: source PRISM raster units\n")
+            precip_df.to_csv(f, index=False, header=False, sep=" ", float_format="%.6f")
+
+        with temp_path.open("w", encoding="utf-8") as f:
+            f.write("PRISM temperature\n")
+            f.write("Real basin catchment-zonal dataset\n")
+            f.write("GridCode TdC_01..TdC_12\n")
+            f.write("Units: source PRISM raster units\n")
+            temp_df.to_csv(f, index=False, header=False, sep=" ", float_format="%.6f")
+
+        station_map = pd.read_csv(station_comid_path)
+        if "ComID" in station_map.columns:
+            station_map["ComID"] = pd.to_numeric(station_map["ComID"], errors="coerce").astype("Int64")
+            station_map = station_map.dropna(subset=["ComID"]).copy()
+            station_map["ComID"] = station_map["ComID"].astype("int64")
+        dat = _build_streamflow_dat_from_gages_csv(
+            base_dir=base_dir,
+            wy=args.wy,
+            station_map=station_map,
+            gages_csv=args.gages_csv,
+            units=args.gages_flow_units,
+            out_dat_path=dat_path,
+            out_da_path=da_path,
+        )
+
+        if dat.empty:
+            print(f"WARNING: No streamflow records generated for WY{args.wy}; check gages CSV year coverage.")
+
+        print(f"Annual-only update complete for WY{args.wy}")
+        print(f"PRISM outputs: {precip_path}, {temp_path}")
+        print(f"Streamflow output: {dat_path}")
+        return
+
     basin_shp_arg = str(args.basin_shp).strip()
     basin_shp_exists = bool(basin_shp_arg) and (base_dir / basin_shp_arg).resolve().exists()
 
@@ -1208,31 +1320,6 @@ def main() -> None:
     if not args.apply:
         print("Dry run complete. Re-run with --apply to write HSR files and catchment/map geometry.")
         return
-
-    flow_dir = hsr_dir / "Flowlines"
-    gis_dir = hsr_dir / "GIS"
-    nlcd_dir = hsr_dir / "NLCD"
-    p_dir = hsr_dir / "PRISM" / "Precipitation"
-    t_dir = hsr_dir / "PRISM" / "Temperature"
-    wu_dir = hsr_dir / "WaterUse"
-    sf_dir = hsr_dir / "Streamflow"
-    gaged_dir = hsr_dir / "GagedCatchments"
-    for d in [flow_dir, gis_dir, nlcd_dir, p_dir, t_dir, wu_dir, sf_dir, gaged_dir]:
-        d.mkdir(parents=True, exist_ok=True)
-
-    station_comid_path = flow_dir / "StationComID.csv"
-    nhdflowline_path = flow_dir / "nhdflowline.txt"
-    nhdflowline_geom_path = flow_dir / "nhdflowline_geometry.gpkg"
-    xwalk_path = flow_dir / "GridCodeComID.txt"
-    vaa_path = gis_dir / "NHDFlowlineVAA.txt"
-    nlcd_path = nlcd_dir / "catchmentattributesnlcd.txt"
-    precip_path = p_dir / f"PrismPrecipWY{args.wy}.dat"
-    temp_path = t_dir / f"PrismTempAveWY{args.wy}.dat"
-    wu_path = wu_dir / "ComID_WU_All.dat"
-    dat_path = sf_dir / f"ComIDStationDAMoAnQ{args.wy}.dat"
-    da_path = sf_dir / "StationDASqMi.csv"
-    catchment_gpkg = base_dir / "inputData" / f"NHDPlusCatchment_{args.ths}.gpkg"
-    flowline_gpkg = base_dir / "inputData" / f"NHDFlowline_{args.ths}.gpkg"
 
     if args.apply:
         for path in [station_comid_path, nhdflowline_path, xwalk_path, vaa_path, nlcd_path, precip_path, temp_path, wu_path, dat_path, da_path]:

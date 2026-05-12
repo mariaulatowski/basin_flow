@@ -713,7 +713,7 @@ class AFinchComprehensiveGUI:
         build_years = list(range(cfg["build_wy_start"], cfg["build_wy_end"] + 1))
         self._log(f"Building network for years: {build_years}\n")
         
-        for wy in build_years:
+        for i, wy in enumerate(build_years):
             self._log(f"\n--- Building streamflow files for WY{wy} ---\n")
             cmd = [
                 sys.executable, str(builder_path),
@@ -738,6 +738,9 @@ class AFinchComprehensiveGUI:
                 cmd += ["--gages-csv", cfg["gages_csv"]]
             if cfg.get("wam_csv"):
                 cmd += ["--wam-csv", cfg["wam_csv"]]
+            # Build static network once; subsequent years only refresh annual files.
+            if (not dry_run) and i > 0:
+                cmd.append("--annual-only")
             if not dry_run:
                 cmd.append("--apply")
 
