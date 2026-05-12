@@ -157,28 +157,38 @@ def read_prism_temp(
         sb_area = np.asarray(sta["SBAreaSqKm"], dtype=float)  # (nSB,)
 
         # --- NLCD land cover (intersect on ComID) ---
-        _, _, ib_nlcd = np.intersect1d(
+        _, ia_nlcd, ib_nlcd = np.intersect1d(
             np.asarray(sta["SBComID"]), comid_ths, return_indices=True
         )
-        nlcd_sub = nlcd_ths[ib_nlcd, :]                          # (nSB, 21)
-        wt_lu = sb_area[:, np.newaxis] * nlcd_sub                # (nSB, 21)
-        total_area_21 = sb_area.sum()
-        sta["NLCD"] = wt_lu.sum(axis=0) / total_area_21          # (21,)
+        if len(ib_nlcd) > 0:
+            area_nlcd = sb_area[ia_nlcd]
+            nlcd_sub = nlcd_ths[ib_nlcd, :]                        # (nMatch, 21)
+            wt_lu = area_nlcd[:, np.newaxis] * nlcd_sub            # (nMatch, 21)
+            total_area_21 = area_nlcd.sum()
+            sta["NLCD"] = wt_lu.sum(axis=0) / max(total_area_21, 1e-12)
 
-        # --- Precipitation (intersect on ComID, reuse ib_nlcd) ---
-        p_sub = p_in[ib_nlcd, :12]                               # (nSB, 12)
-        wt_p = sb_area[:, np.newaxis] * p_sub                    # (nSB, 12)
-        total_area_12 = sb_area.sum()
-        sta["Precip"] = wt_p.sum(axis=0) / total_area_12         # (12,)
+            # --- Precipitation (intersect on ComID, reuse ib_nlcd) ---
+            p_sub = p_in[ib_nlcd, :12]                             # (nMatch, 12)
+            wt_p = area_nlcd[:, np.newaxis] * p_sub                # (nMatch, 12)
+            total_area_12 = area_nlcd.sum()
+            sta["Precip"] = wt_p.sum(axis=0) / max(total_area_12, 1e-12)
+        else:
+            sta["NLCD"] = np.zeros(21, dtype=float)
+            sta["Precip"] = np.zeros(12, dtype=float)
+
         prsm_prec[iy, s_idx, :] = sta["Precip"]
 
         # --- Temperature (intersect on GridCode) ---
-        _, _, ib_t = np.intersect1d(
+        _, ia_t, ib_t = np.intersect1d(
             np.asarray(sta["SBGridCode"]), grid_code_t, return_indices=True
         )
-        area_t = sb_area[: len(ib_t)]                            # align to matched subset
-        wt_tc = area_t[:, np.newaxis] * tdc[ib_t, :12]          # (nMatch, 12)
-        sta["Temp"] = wt_tc.sum(axis=0) / area_t.sum()           # (12,)
+        if len(ib_t) > 0:
+            area_t = sb_area[ia_t]
+            wt_tc = area_t[:, np.newaxis] * tdc[ib_t, :12]        # (nMatch, 12)
+            sta["Temp"] = wt_tc.sum(axis=0) / max(area_t.sum(), 1e-12)
+        else:
+            sta["Temp"] = np.zeros(12, dtype=float)
+
         prsm_temp[iy, s_idx, :] = sta["Temp"]
 
         afstruct[hsr][iy][s_idx] = sta

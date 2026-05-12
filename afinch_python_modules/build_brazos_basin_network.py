@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from collections import defaultdict, deque
 from io import StringIO
 from pathlib import Path
 
@@ -218,10 +219,14 @@ def _build_streamflow_dat_from_gages_csv(
     out_dat_path: Path,
     out_da_path: Path,
 ) -> pd.DataFrame:
-    gages_path = Path(gages_csv)
-    if not gages_path.is_absolute():
-        gages_path = base_dir / gages_csv
-    if not gages_path.exists():
+    if gages_csv:
+        gages_path = Path(gages_csv)
+        if not gages_path.is_absolute():
+            gages_path = base_dir / gages_csv
+    else:
+        gages_path = base_dir / "inputData" / "inputs" / "monthly_wide_acft.csv"
+
+    if not gages_path.exists() or gages_path.is_dir():
         return pd.DataFrame()
 
     src = pd.read_csv(gages_path)
@@ -354,6 +359,115 @@ def _build_real_nlcd(flow_geom: gpd.GeoDataFrame, nlcd_raster: Path) -> pd.DataF
     return out
 
 
+def _iter_raster_block_zone_values(
+    polygons: gpd.GeoDataFrame,
+    raster_path: Path,
+    *,
+    categorical_codes: list[int] | None = None,
+) -> tuple[np.ndarray, dict[int, np.ndarray] | np.ndarray, np.ndarray]:
+    from rasterio.features import bounds as geom_bounds, rasterize
+    from shapely.geometry import box
+
+    if polygons.empty:
+        empty = np.zeros(0, dtype=float)
+        return empty, {code: empty.copy() for code in categorical_codes or []} if categorical_codes else empty.copy(), empty
+
+    with rasterio.open(raster_path) as src:
+        zones = polygons[["ComID", "geometry"]].copy()
+        if zones.crs is None:
+            zones = gpd.GeoDataFrame(zones, geometry="geometry", crs="EPSG:4269")
+        zones = zones.to_crs(src.crs)
+        zones = zones.dropna(subset=["geometry"]).copy()
+        zones = zones[~zones.geometry.is_empty].copy()
+        zones = zones.reset_index(drop=True)
+        zone_count = len(zones)
+        zone_ids = np.arange(1, zone_count + 1, dtype=np.int32)
+        sindex = zones.sindex
+
+        total = np.zeros(zone_count + 1, dtype=float)
+        if categorical_codes is not None:
+            cat_counts = {code: np.zeros(zone_count + 1, dtype=float) for code in categorical_codes}
+        else:
+            sums = np.zeros(zone_count + 1, dtype=float)
+
+        raster_bounds = box(*src.bounds)
+        for _, window in src.block_windows(1):
+            win_bounds = rasterio.windows.bounds(window, src.transform)
+            win_box = box(*win_bounds)
+            if not win_box.intersects(raster_bounds):
+                continue
+            idx = list(sindex.query(win_box, predicate="intersects"))
+            if not idx:
+                continue
+
+            arr = src.read(1, window=window, masked=True)
+            if arr.size == 0:
+                continue
+            arr_data = np.asarray(arr.data, dtype=float)
+            valid_data = np.isfinite(arr_data)
+            if np.ma.isMaskedArray(arr):
+                valid_data &= ~np.asarray(arr.mask)
+            if not valid_data.any():
+                continue
+
+            transform = src.window_transform(window)
+            shapes = []
+            for i in idx:
+                geom = zones.geometry.iloc[i]
+                try:
+                    if box(*geom_bounds(geom)).intersects(win_box):
+                        shapes.append((geom, int(zone_ids[i])))
+                except Exception:
+                    continue
+            if not shapes:
+                continue
+
+            zone_arr = rasterize(
+                shapes,
+                out_shape=arr_data.shape,
+                transform=transform,
+                fill=0,
+                dtype="int32",
+                all_touched=False,
+            )
+            valid = (zone_arr > 0) & valid_data
+            if not valid.any():
+                continue
+
+            z = zone_arr[valid].ravel()
+            total += np.bincount(z, minlength=zone_count + 1).astype(float)
+            vals = arr_data[valid].ravel()
+            if categorical_codes is not None:
+                rounded = np.rint(vals).astype(int)
+                for code in categorical_codes:
+                    code_z = z[rounded == code]
+                    if code_z.size:
+                        cat_counts[code] += np.bincount(code_z, minlength=zone_count + 1).astype(float)
+            else:
+                sums += np.bincount(z, weights=vals, minlength=zone_count + 1).astype(float)
+
+        if categorical_codes is not None:
+            return zones["ComID"].to_numpy(dtype=np.int64), {code: vals[1:] for code, vals in cat_counts.items()}, total[1:]
+        return zones["ComID"].to_numpy(dtype=np.int64), sums[1:], total[1:]
+
+
+def _build_catchment_nlcd(catch_geom: gpd.GeoDataFrame, nlcd_raster: Path) -> pd.DataFrame:
+    comids, counts_by_code, totals = _iter_raster_block_zone_values(
+        catch_geom,
+        nlcd_raster,
+        categorical_codes=NLCD_CLASSES,
+    )
+    out = pd.DataFrame({"ComID": comids, "GridCode": comids})
+    denom = np.where(totals > 0, totals, np.nan)
+    for code in NLCD_CLASSES:
+        out[f"NLCD{code}"] = np.nan_to_num((counts_by_code[code] / denom) * 100.0, nan=0.0)
+    out["PCTCN"] = 0.0
+    out["PCTMX"] = 0.0
+    nlcd_cols = [f"NLCD{c}" for c in NLCD_CLASSES]
+    out["SUMPCT"] = out[nlcd_cols].sum(axis=1)
+    return out
+
+
 def _build_real_prism(base_dir: Path, flow_geom: gpd.GeoDataFrame, wy: int, prism_ppt_dir: str, prism_tmean_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     points = flow_geom[["ComID", "geometry"]].copy()
     points["geometry"] = points.geometry.representative_point()
@@ -396,6 +510,52 @@ def _build_real_prism(base_dir: Path, flow_geom: gpd.GeoDataFrame, wy: int, pris
     for month in range(12):
         temp[f"TdC_{month + 1:02d}"] = tmean_stack[:, month]
 
+    return precip, temp
+
+
+def _build_catchment_prism(base_dir: Path, catch_geom: gpd.GeoDataFrame, wy: int, prism_ppt_dir: str, prism_tmean_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    area_map = catch_geom.set_index("ComID")["AreaSqKm"].to_dict() if "AreaSqKm" in catch_geom.columns else {}
+    ppt_vals: list[np.ndarray] = []
+    tmean_vals: list[np.ndarray] = []
+    comids_ref: np.ndarray | None = None
+
+    for year, month in _wy_months(wy):
+        ppt_path = _resolve_prism_raster(base_dir, prism_ppt_dir, "ppt", year, month)
+        tmean_path = _resolve_prism_raster(base_dir, prism_tmean_dir, "tmean", year, month)
+
+        ppt_comids, ppt_sums, ppt_counts = _iter_raster_block_zone_values(catch_geom, ppt_path)
+        tmp_comids, tmp_sums, tmp_counts = _iter_raster_block_zone_values(catch_geom, tmean_path)
+        if comids_ref is None:
+            comids_ref = ppt_comids
+        if not np.array_equal(comids_ref, ppt_comids) or not np.array_equal(comids_ref, tmp_comids):
+            raise RuntimeError("Catchment zonal raster processing returned inconsistent ComID order")
+
+        ppt_vals.append(np.divide(ppt_sums, ppt_counts, out=np.full_like(ppt_sums, np.nan, dtype=float), where=ppt_counts > 0))
+        tmean_vals.append(np.divide(tmp_sums, tmp_counts, out=np.full_like(tmp_sums, np.nan, dtype=float), where=tmp_counts > 0))
+
+    if comids_ref is None:
+        return pd.DataFrame(), pd.DataFrame()
+
+    ppt_stack = np.column_stack(ppt_vals)
+    tmean_stack = np.column_stack(tmean_vals)
+    for stack in [ppt_stack, tmean_stack]:
+        for col in range(stack.shape[1]):
+            vals = stack[:, col]
+            med = np.nanmedian(vals)
+            if not np.isfinite(med):
+                med = 0.0
+            vals[np.isnan(vals)] = med
+            stack[:, col] = vals
+
+    area_sqmi = np.array([float(area_map.get(int(c), 1.0)) * SQKM_TO_SQMI for c in comids_ref], dtype=float)
+    precip = pd.DataFrame({"GridCode": comids_ref, "GCAreaSqMi": area_sqmi})
+    for month in range(12):
+        precip[f"PIn_{month + 1:02d}"] = ppt_stack[:, month]
+    precip["PIn_13"] = ppt_stack.mean(axis=1)
+
+    temp = pd.DataFrame({"GridCode": comids_ref})
+    for month in range(12):
+        temp[f"TdC_{month + 1:02d}"] = tmean_stack[:, month]
     return precip, temp
 
 
@@ -721,6 +881,87 @@ def _load_basin_flowline_and_vaa(gdbs: list[tuple[str, Path]], basin_gdf: gpd.Ge
     return flow_tbl, vaa_out, flow_geom[["ComID", "ReachCode", "OrigReachCode", "geometry"]].copy()
 
 
+def _load_basin_catchments(
+    gdbs: list[tuple[str, Path]],
+    basin_gdf: gpd.GeoDataFrame,
+    flow_tbl: pd.DataFrame,
+) -> gpd.GeoDataFrame:
+    import fiona
+    import warnings
+
+    basin_latlon = basin_gdf.to_crs(4269)
+    bbox = tuple(float(v) for v in basin_latlon.total_bounds)
+    valid_comids = set(flow_tbl["ComID"].astype("int64").tolist())
+    parts: list[gpd.GeoDataFrame] = []
+
+    def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+        lower_map = {str(c).lower(): c for c in df.columns}
+        for name in candidates:
+            found = lower_map.get(name.lower())
+            if found is not None:
+                return found
+        return None
+
+    for hu4, gdb in gdbs:
+        try:
+            layers = set(fiona.listlayers(gdb))
+        except Exception:
+            continue
+        catch_layer = next((name for name in layers if name.lower() in {"nhdpluscatchment", "catchment"}), None)
+        if catch_layer is None:
+            catch_layer = next((name for name in layers if "catchment" in name.lower()), None)
+        if catch_layer is None:
+            continue
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            catch = gpd.read_file(
+                gdb,
+                layer=catch_layer,
+                bbox=bbox,
+                columns=["NHDPlusID", "ComID", "COMID", "GridCode", "AreaSqKm", "geometry"],
+            )
+        if catch.empty:
+            continue
+        if catch.crs is None:
+            catch = catch.set_crs(basin_latlon.crs)
+        catch = gpd.clip(catch.to_crs(basin_latlon.crs), basin_latlon)
+        if catch.empty:
+            continue
+
+        id_col = _pick_col(catch, ["nhdplusid", "comid", "gridcode"])
+        if id_col is None:
+            print(f"WARNING: No ComID-like field in catchment layer for {hu4}; skipping")
+            continue
+        catch["ComID"] = pd.to_numeric(catch[id_col], errors="coerce")
+        catch = catch.dropna(subset=["ComID", "geometry"]).copy()
+        catch["ComID"] = catch["ComID"].astype("int64")
+        catch = catch[catch["ComID"].isin(valid_comids)].copy()
+        if catch.empty:
+            continue
+
+        area_col = _pick_col(catch, ["areasqkm", "area_sqkm"])
+        if area_col is not None:
+            catch["AreaSqKm"] = pd.to_numeric(catch[area_col], errors="coerce")
+        else:
+            catch["AreaSqKm"] = np.nan
+        missing_area = catch["AreaSqKm"].isna() | (catch["AreaSqKm"] <= 0)
+        if missing_area.any():
+            area_proj = catch.loc[missing_area, ["geometry"]].to_crs(5070)
+            catch.loc[missing_area, "AreaSqKm"] = area_proj.geometry.area.to_numpy(dtype=float) / 1_000_000.0
+
+        parts.append(catch[["ComID", "AreaSqKm", "geometry"]].copy())
+        print(f"  Loaded catchments {hu4}: {len(catch):,}")
+
+    if not parts:
+        return gpd.GeoDataFrame(columns=["ComID", "AreaSqKm", "geometry"], geometry="geometry", crs=basin_latlon.crs)
+
+    out = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), geometry="geometry", crs=parts[0].crs)
+    out = out.sort_values(["ComID", "AreaSqKm"], ascending=[True, False]).drop_duplicates(subset=["ComID"], keep="first")
+    out = out.reset_index(drop=True)
+    return out
+
+
 def _map_stations_to_comid(
     flow_geom: gpd.GeoDataFrame,
     station_points: pd.DataFrame,
@@ -757,6 +998,76 @@ def _map_stations_to_comid(
     nearest["ComID"] = pd.to_numeric(nearest["ComID"], errors="coerce").astype("int64")
     nearest = nearest.sort_values(["Station", "snap_dist_m"]).drop_duplicates(subset=["Station"], keep="first")
     return pd.DataFrame(nearest[["Station", "ComID", "Source", "snap_dist_m"]]).sort_values("Station")
+
+
+def _build_vaa_upstream_map(vaa_df: pd.DataFrame) -> dict[int, list[int]]:
+    """Build downstream COMID -> immediate upstream COMIDs from VAA node topology."""
+    cols = {str(c).lower(): c for c in vaa_df.columns}
+    required = ["comid", "fromnode", "tonode", "hydroseq"]
+    missing = [name for name in required if name not in cols]
+    if missing:
+        raise KeyError(f"VAA missing required columns for upstream tracing: {missing}")
+
+    work = vaa_df[[cols["comid"], cols["fromnode"], cols["tonode"], cols["hydroseq"]]].copy()
+    work.columns = ["ComID", "FromNode", "ToNode", "HydroSeq"]
+    for col in ["ComID", "FromNode", "ToNode", "HydroSeq"]:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    work = work.dropna(subset=["ComID", "FromNode", "ToNode", "HydroSeq"]).copy()
+    work = work[(work["FromNode"] > 0) & (work["ToNode"] > 0)].copy()
+    work["ComID"] = work["ComID"].astype("int64")
+    work["FromNode"] = work["FromNode"].astype("int64")
+    work["ToNode"] = work["ToNode"].astype("int64")
+
+    upstream = work[["ComID", "ToNode", "HydroSeq"]].rename(
+        columns={"ComID": "UpComID", "ToNode": "JoinNode", "HydroSeq": "UpHydroSeq"}
+    )
+    downstream = work[["ComID", "FromNode", "HydroSeq"]].rename(
+        columns={"ComID": "DsComID", "FromNode": "JoinNode", "HydroSeq": "DsHydroSeq"}
+    )
+    edges = upstream.merge(downstream, on="JoinNode", how="inner")
+    edges = edges[edges["UpComID"] != edges["DsComID"]]
+    edges = edges[edges["UpHydroSeq"] > edges["DsHydroSeq"]]
+    edges = edges[["DsComID", "UpComID"]].drop_duplicates()
+
+    upstream_map: dict[int, list[int]] = defaultdict(list)
+    for row in edges.itertuples(index=False):
+        upstream_map[int(row.DsComID)].append(int(row.UpComID))
+    return {k: sorted(v) for k, v in upstream_map.items()}
+
+
+def _find_upstream_comids(start_comid: int, upstream_map: dict[int, list[int]], valid_comids: set[int]) -> list[int]:
+    visited = {int(start_comid)}
+    queue = deque([int(start_comid)])
+
+    while queue:
+        current = queue.popleft()
+        for upstream_comid in upstream_map.get(current, []):
+            upstream_comid = int(upstream_comid)
+            if upstream_comid in visited or upstream_comid not in valid_comids:
+                continue
+            visited.add(upstream_comid)
+            queue.append(upstream_comid)
+
+    return sorted(visited)
+
+
+def _allocate_station_member_areas(
+    members: list[int],
+    dasqmi: float,
+    length_km_map: dict[int, float],
+) -> dict[int, float]:
+    if not members:
+        return {}
+
+    total_sqkm = max(0.01, float(dasqmi) / SQKM_TO_SQMI)
+    weights = np.array([max(0.0, float(length_km_map.get(comid, 0.0))) for comid in members], dtype=float)
+    if not np.isfinite(weights).all() or float(weights.sum()) <= 0:
+        weights = np.ones(len(members), dtype=float)
+
+    areas = total_sqkm * weights / float(weights.sum())
+    areas = np.maximum(areas, 0.000001)
+    return {int(comid): float(area) for comid, area in zip(members, areas)}
 
 
 def _normalize_station_id_local(s: str) -> str:
@@ -883,6 +1194,11 @@ def main() -> None:
     flow_tbl, vaa_tbl, flow_geom = _load_basin_flowline_and_vaa(hu4_gdbs, basin_gdf, args.ths)
     comids = flow_tbl["ComID"].to_numpy(dtype=np.int64)
     print(f"Flowlines prepared: {len(flow_tbl):,} reaches")
+    catch_geom = _load_basin_catchments(hu4_gdbs, basin_gdf, flow_tbl)
+    if not catch_geom.empty:
+        print(f"Catchment polygons prepared: {len(catch_geom):,} polygons")
+    else:
+        print("WARNING: No matching NHDPlus catchment polygons found; falling back to point-sampled raster attributes.")
 
     station_points = _load_station_points_flexible(base_dir, args.gages_csv, args.wam_csv)
     station_map = _map_stations_to_comid(flow_geom, station_points, station_mask=station_mask)
@@ -930,20 +1246,32 @@ def main() -> None:
     if not nlcd_raster_path.exists():
         raise FileNotFoundError(nlcd_raster_path)
 
-    nlcd_df = _build_real_nlcd(flow_geom, nlcd_raster_path)
+    if not catch_geom.empty:
+        nlcd_df = _build_catchment_nlcd(catch_geom, nlcd_raster_path)
+    else:
+        nlcd_df = _build_real_nlcd(flow_geom, nlcd_raster_path)
     nlcd_df.to_csv(nlcd_path, index=False)
 
-    precip_df, temp_df = _build_real_prism(base_dir, flow_geom, args.wy, args.prism_ppt_dir, args.prism_tmean_dir)
+    if not catch_geom.empty:
+        precip_df, temp_df = _build_catchment_prism(base_dir, catch_geom, args.wy, args.prism_ppt_dir, args.prism_tmean_dir)
+    else:
+        precip_df, temp_df = _build_real_prism(base_dir, flow_geom, args.wy, args.prism_ppt_dir, args.prism_tmean_dir)
     with precip_path.open("w", encoding="utf-8") as f:
         f.write("PRISM precipitation\n")
-        f.write("Real Brazos full-basin raster-sampled dataset\n")
+        if not catch_geom.empty:
+            f.write("Real Brazos full-basin catchment-zonal dataset\n")
+        else:
+            f.write("Real Brazos full-basin raster-sampled dataset\n")
         f.write("GridCode GCAreaSqMi PIn_01..PIn_13\n")
         f.write("Units: source PRISM raster units\n")
         precip_df.to_csv(f, index=False, header=False, sep=" ", float_format="%.6f")
 
     with temp_path.open("w", encoding="utf-8") as f:
         f.write("PRISM temperature\n")
-        f.write("Real Brazos full-basin raster-sampled dataset\n")
+        if not catch_geom.empty:
+            f.write("Real Brazos full-basin catchment-zonal dataset\n")
+        else:
+            f.write("Real Brazos full-basin raster-sampled dataset\n")
         f.write("GridCode TdC_01..TdC_12\n")
         f.write("Units: source PRISM raster units\n")
         temp_df.to_csv(f, index=False, header=False, sep=" ", float_format="%.6f")
@@ -985,30 +1313,68 @@ def main() -> None:
         da = pd.read_csv(da_path) if da_path.exists() else pd.DataFrame(columns=["Station", "ComID", "DASqMi"])
 
     reach_lookup = flow_geom.set_index("ComID")["ReachCode"].to_dict()
+    length_km_map = flow_tbl.set_index("ComID")["LengthKm"].to_dict()
+    catch_area_map = catch_geom.set_index("ComID")["AreaSqKm"].to_dict() if not catch_geom.empty else {}
     if not da.empty:
         da = da.copy()
         da["Station"] = da["Station"].map(_norm_station_id)
         da_map = da.set_index("Station")["DASqMi"].to_dict()
     else:
         da_map = {}
+
+    valid_comids = set(flow_tbl["ComID"].astype("int64").tolist())
+    upstream_map = _build_vaa_upstream_map(vaa_tbl)
+    print(f"VAA upstream topology prepared: {sum(len(v) for v in upstream_map.values()):,} immediate upstream links")
+
     station_list_path = gaged_dir / "StationList.txt"
     station_ids = station_map["Station"].astype(str).sort_values().tolist()
     station_list_path.write_text("\n".join(station_ids) + "\n", encoding="utf-8")
 
+    upstream_counts: list[int] = []
     for _, row in station_map.iterrows():
         station = row["Station"]
         comid = int(row["ComID"])
         dasqmi = float(da_map.get(station, 1.0))
-        area_sqkm = max(0.01, dasqmi / SQKM_TO_SQMI)
-        reach = str(reach_lookup.get(comid, f"{args.ths}0000000000"))
+        members = _find_upstream_comids(comid, upstream_map, valid_comids)
+        areas = {
+            int(member): float(catch_area_map[member])
+            for member in members
+            if member in catch_area_map and np.isfinite(float(catch_area_map[member])) and float(catch_area_map[member]) > 0
+        }
+        if len(areas) < len(members):
+            allocated = _allocate_station_member_areas(members, dasqmi, length_km_map)
+            for member in members:
+                areas.setdefault(int(member), allocated.get(int(member), 0.01))
+        upstream_counts.append(len(members))
+
         out = gaged_dir / f"{station}.dat"
         with out.open("w", encoding="utf-8") as f:
             f.write("GridCode,ComID,AreaSqKm,ReachCode\n")
-            f.write(f"{comid},{comid},{area_sqkm:.6f},{reach}\n")
+            for member_comid in members:
+                area_sqkm = areas.get(member_comid, 0.000001)
+                reach = str(reach_lookup.get(member_comid, f"{args.ths}0000000000"))
+                f.write(f"{member_comid},{member_comid},{area_sqkm:.6f},{reach}\n")
 
-    catch = flow_geom.rename(columns={"ComID": "NHDPlusID"}).copy()
-    catch["GridCode"] = catch["NHDPlusID"]
-    catch = catch[["NHDPlusID", "GridCode", "ReachCode", "OrigReachCode", "geometry"]]
+    if upstream_counts:
+        counts = pd.Series(upstream_counts)
+        one_reach = int((counts <= 1).sum())
+        print(
+            "Gaged upstream catchments written: "
+            f"stations={len(upstream_counts):,}, min={int(counts.min()):,}, "
+            f"median={int(counts.median()):,}, max={int(counts.max()):,}, "
+            f"one-reach={one_reach:,}"
+        )
+
+    if not catch_geom.empty:
+        catch = catch_geom.rename(columns={"ComID": "NHDPlusID"}).copy()
+        catch["GridCode"] = catch["NHDPlusID"]
+        catch = catch.merge(flow_geom[["ComID", "ReachCode", "OrigReachCode"]], left_on="NHDPlusID", right_on="ComID", how="left")
+        catch = catch.drop(columns=[c for c in ["ComID"] if c in catch.columns])
+        catch = catch[["NHDPlusID", "GridCode", "AreaSqKm", "ReachCode", "OrigReachCode", "geometry"]]
+    else:
+        catch = flow_geom.rename(columns={"ComID": "NHDPlusID"}).copy()
+        catch["GridCode"] = catch["NHDPlusID"]
+        catch = catch[["NHDPlusID", "GridCode", "ReachCode", "OrigReachCode", "geometry"]]
     catch.to_file(catchment_gpkg, driver="GPKG")
 
     print(f"Wrote basin package for THS {args.ths} / {args.hsr}")

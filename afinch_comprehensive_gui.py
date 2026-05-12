@@ -28,6 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 import geopandas as gpd
+import pandas as pd
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Palette and fonts
@@ -674,6 +675,7 @@ class AFinchComprehensiveGUI:
                 self._do_build_network(cfg, dry_run=dry_run)
                 if not dry_run:
                     self._do_build_upstream_gaged(cfg)
+                    self._verify_gaged_network(cfg)
                 status_msg = "✓ Build complete" if not dry_run else "✓ Dry run passed"
                 self._log_q.put(("status", ("build_ok", status_msg)))
             except Exception as exc:
@@ -731,7 +733,7 @@ class AFinchComprehensiveGUI:
             raise RuntimeError(f"Builder exited with code {rc}")
 
     def _do_build_upstream_gaged(self, cfg: dict):
-        """Optional legacy step: generate upstream contributing catchments for USGS gages."""
+        """Generate upstream contributing catchments for USGS gages from VAA topology."""
         base = cfg["base_dir"]
         script_path = base / "afinch_python_modules" / "build_usgs_upstream_spatial.py"
         if not script_path.exists():
@@ -741,21 +743,14 @@ class AFinchComprehensiveGUI:
         catchment_path = base / catchment_rel
         if not catchment_path.exists():
             self._log(
-                f"Skipping legacy upstream gaged-catchment build: catchment file not found ({catchment_path}).\n",
+                f"Upstream gaged-catchment build will use VAA topology; mapping GeoPackage not found ({catchment_path}).\n",
                 "warn",
             )
-            return
-
-        catchments = gpd.read_file(catchment_path)
-        geom_types = set(catchments.geometry.geom_type.dropna().astype(str))
-        polygon_types = {"Polygon", "MultiPolygon"}
-        if geom_types and not geom_types.issubset(polygon_types):
+        else:
             self._log(
-                "Skipping legacy upstream gaged-catchment build: "
-                f"{catchment_path.name} contains {sorted(geom_types)} geometry, but the legacy script requires polygon catchments.\n",
-                "warn",
+                f"Running upstream gaged-catchment build from VAA topology; geometry source: {catchment_path.name}\n",
+                "ok",
             )
-            return
 
         cmd = [
             sys.executable,
@@ -771,7 +766,7 @@ class AFinchComprehensiveGUI:
             "--apply",
         ]
 
-        self._log("\nRunning legacy upstream gaged-catchment build...\n", "ok")
+        self._log("\nRunning upstream gaged-catchment build...\n", "ok")
         self._log(f"Command:\n  {' '.join(cmd)}\n")
         proc = subprocess.Popen(
             cmd,
@@ -787,6 +782,47 @@ class AFinchComprehensiveGUI:
         rc = proc.wait()
         if rc != 0:
             raise RuntimeError(f"Upstream gaged-catchment builder exited with code {rc}")
+
+    def _verify_gaged_network(self, cfg: dict):
+        gaged_dir = cfg["base_dir"] / cfg["hsr"] / "GagedCatchments"
+        station_list_path = gaged_dir / "StationList.txt"
+        if not station_list_path.exists():
+            raise FileNotFoundError(f"Missing StationList after build: {station_list_path}")
+
+        stations = [s.strip() for s in station_list_path.read_text(encoding="utf-8").splitlines() if s.strip()]
+        if not stations:
+            raise RuntimeError(f"StationList is empty after build: {station_list_path}")
+
+        counts: list[int] = []
+        missing: list[str] = []
+        for station in stations:
+            path = gaged_dir / f"{station}.dat"
+            if not path.exists():
+                missing.append(station)
+                continue
+            n_rows = max(0, sum(1 for _ in path.open(encoding="utf-8")) - 1)
+            counts.append(n_rows)
+
+        if missing:
+            raise RuntimeError(f"Missing gaged catchment files for {len(missing)} station(s): {', '.join(missing[:10])}")
+        if not counts:
+            raise RuntimeError("No gaged catchment rows were written.")
+
+        counts_s = pd.Series(counts)
+        one_reach = int((counts_s <= 1).sum())
+        self._log(
+            "Verified gaged catchments: "
+            f"stations={len(counts):,}, min={int(counts_s.min()):,}, "
+            f"median={int(counts_s.median()):,}, max={int(counts_s.max()):,}, "
+            f"one-reach={one_reach:,}\n",
+            "ok" if one_reach == 0 else "warn",
+        )
+
+        if one_reach == len(counts):
+            raise RuntimeError(
+                "Build produced one-reach gaged catchments for every station. "
+                "The upstream contributor network was not written correctly."
+            )
 
     def _validate_build_cfg(self) -> dict:
         base = Path(self.v_base_dir.get().strip())
@@ -1142,25 +1178,64 @@ class AFinchComprehensiveGUI:
             mo = i + 1  # WY month 1=Oct … 12=Sep
             cfs_month_map[mo] = col
 
-        # ── 2. Load NHD flowline geometry from GagedCatchments or GIS ──────────
+        # ── 2. Load line geometry for modeled ComIDs (preferred) ───────────────
         catchment_gpkg = base / "inputData" / f"NHDPlusCatchment_{ths}.gpkg"
-        flowline_shp   = hsr_dir / "Flowlines" / "nhdflowline.txt"
+        line_candidates = [
+            hsr_dir / "Flowlines" / "nhdflowline_geometry.gpkg",
+            base / "inputData" / f"NHDFlowline_{ths}.gpkg",
+            base / "inputData" / "flowlines" / "Brazos_Flowline.shp",
+        ]
 
-        # PRIORITY: Load from catchment GeoPackage which contains the matching HSR ComIDs
-        if not catchment_gpkg.exists():
-            raise FileNotFoundError(
-                f"Catchment GeoPackage not found: {catchment_gpkg}\n"
-                "The shapefile export requires the HSR network build output.\n"
-                "Run 'Build Network' first."
+        geom_gdf = None
+        for candidate in line_candidates:
+            if not candidate.exists():
+                continue
+            try:
+                probe = gpd.read_file(candidate, rows=5)
+            except Exception:
+                continue
+
+            if probe.empty:
+                continue
+
+            comid_field = next((c for c in ["ComID", "COMID", "NHDPlusID", "GridCode"] if c in probe.columns), None)
+            if comid_field is None:
+                continue
+
+            geom_types = set(probe.geometry.geom_type.dropna().unique().tolist())
+            if not (geom_types & {"LineString", "MultiLineString"}):
+                continue
+
+            self._log(f"Loading flowline geometry from {candidate}\n")
+            geom_gdf = gpd.read_file(candidate)
+            geom_gdf = geom_gdf.rename(columns={comid_field: "ComID"})
+            break
+
+        if geom_gdf is None:
+            if not catchment_gpkg.exists():
+                raise FileNotFoundError(
+                    "No flowline geometry source was found for shapefile export, and catchment fallback is missing.\n"
+                    f"Checked line sources: {', '.join(str(p) for p in line_candidates)}\n"
+                    f"Missing catchment fallback: {catchment_gpkg}"
+                )
+            self._log(
+                "WARNING: Flowline geometry not found; falling back to catchment polygons.\n"
+                f"Fallback geometry source: {catchment_gpkg}\n",
+                "warn",
             )
-
-        self._log(f"Loading reach geometry from {catchment_gpkg}\n")
-        geom_gdf = gpd.read_file(catchment_gpkg)
-        comid_field = "NHDPlusID" if "NHDPlusID" in geom_gdf.columns else geom_gdf.columns[0]
-        geom_gdf = geom_gdf.rename(columns={comid_field: "ComID"})
+            geom_gdf = gpd.read_file(catchment_gpkg)
+            comid_field = "NHDPlusID" if "NHDPlusID" in geom_gdf.columns else geom_gdf.columns[0]
+            geom_gdf = geom_gdf.rename(columns={comid_field: "ComID"})
 
         geom_gdf["ComID"] = pd.to_numeric(geom_gdf["ComID"], errors="coerce").astype("Int64")
         geom_gdf = geom_gdf.dropna(subset=["ComID"])
+        modeled_comids = set(pd.to_numeric(flow_df[comid_col], errors="coerce").dropna().astype("int64").tolist())
+        before_filter = len(geom_gdf)
+        geom_gdf = geom_gdf[geom_gdf["ComID"].astype("int64").isin(modeled_comids)].copy()
+        if geom_gdf.empty:
+            raise RuntimeError("No matching ComIDs between modeled flow output and geometry source.")
+        if len(geom_gdf) < before_filter:
+            self._log(f"Filtered geometry to modeled reaches: {len(geom_gdf):,} of {before_filter:,}\n")
 
         # ── 3. Join flow data to geometry ──────────────────────────────────────
         self._log(f"Joining flow data to {len(geom_gdf)} geometries…\n")

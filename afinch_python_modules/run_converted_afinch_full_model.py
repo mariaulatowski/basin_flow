@@ -240,20 +240,8 @@ class ConvertedAFinchPipeline:
         p_dir.mkdir(parents=True, exist_ok=True)
         t_dir.mkdir(parents=True, exist_ok=True)
 
-        # Fast path: all files exist
-        missing_years: list[int] = []
-        for wy in range(self.wy1_reg, self.wy1_reg + self.ny_reg):
-            if not (p_dir / f"PrismPrecipWY{wy}.dat").exists() or not (t_dir / f"PrismTempAveWY{wy}.dat").exists():
-                missing_years.append(wy)
-        if not missing_years:
-            return
-
-        self.log(
-            f"[Regression] Missing HSR PRISM files for WY {missing_years[0]}-{missing_years[-1]}; "
-            "building from inputData/prism_monthly rasters...\n"
-        )
-
-        # Geometry with ComID + line geometry is produced by the network build step.
+        # Geometry with ComID is produced by the network build step. New builds write
+        # polygon NHDPlusCatchment geometry; older builds wrote flowline geometry.
         catchment_gpkg = self.base_dir / "inputData" / f"NHDPlusCatchment_{self.ths}.gpkg"
         if not catchment_gpkg.exists():
             raise FileNotFoundError(
@@ -274,44 +262,100 @@ class ConvertedAFinchPipeline:
         gdf["ComID"] = pd.to_numeric(gdf[comid_col], errors="coerce")
         gdf = gdf.dropna(subset=["ComID", "geometry"]).copy()
         gdf["ComID"] = gdf["ComID"].astype("int64")
-        flow_geom = gdf[["ComID", "geometry"]].copy()
+        prism_geom_cols = ["ComID", "geometry"]
+        if "AreaSqKm" in gdf.columns:
+            prism_geom_cols.insert(1, "AreaSqKm")
+        prism_geom = gdf[prism_geom_cols].copy()
+        geom_types = set(prism_geom.geometry.geom_type.dropna().unique())
+        use_catchment_zonal = bool(geom_types & {"Polygon", "MultiPolygon"})
+
+        def _has_catchment_zonal_header(path: Path) -> bool:
+            if not path.exists():
+                return False
+            try:
+                return "catchment-zonal" in path.read_text(encoding="utf-8", errors="ignore")[:512].lower()
+            except OSError:
+                return False
+
+        years_to_build: list[int] = []
+        stale_years: list[int] = []
+        for wy in range(self.wy1_reg, self.wy1_reg + self.ny_reg):
+            p_path = p_dir / f"PrismPrecipWY{wy}.dat"
+            t_path = t_dir / f"PrismTempAveWY{wy}.dat"
+            missing = not p_path.exists() or not t_path.exists()
+            stale = (
+                use_catchment_zonal
+                and not missing
+                and (not _has_catchment_zonal_header(p_path) or not _has_catchment_zonal_header(t_path))
+            )
+            if missing or stale:
+                years_to_build.append(wy)
+            if stale:
+                stale_years.append(wy)
+
+        if not years_to_build:
+            return
+
+        kind = "catchment-zonal" if use_catchment_zonal else "raster-sampled"
+        self.log(
+            f"[Regression] Building {kind} HSR PRISM files for WY {years_to_build[0]}-{years_to_build[-1]} "
+            "from inputData/prism_monthly rasters...\n"
+        )
+        if stale_years:
+            self.log(
+                f"[Regression] Rebuilding stale point-sampled PRISM files as catchment-zonal for "
+                f"WY {stale_years[0]}-{stale_years[-1]}.\n"
+            )
 
         # Reuse PRISM sampling logic from basin builder.
-        from afinch_python_modules.build_brazos_basin_network import _build_real_prism
+        from afinch_python_modules.build_brazos_basin_network import _build_catchment_prism, _build_real_prism
 
         prism_ppt_src = _pick_prism_source_dir(self.base_dir, "ppt")
         prism_tmean_src = _pick_prism_source_dir(self.base_dir, "tmean")
 
-        for wy in missing_years:
+        for wy in years_to_build:
             p_path = p_dir / f"PrismPrecipWY{wy}.dat"
             t_path = t_dir / f"PrismTempAveWY{wy}.dat"
-            if p_path.exists() and t_path.exists():
-                continue
 
             self.log(f"[Regression] Building HSR PRISM yearly files for WY{wy}...\n")
-            precip_df, temp_df = _build_real_prism(
-                self.base_dir,
-                flow_geom,
-                wy,
-                prism_ppt_src,
-                prism_tmean_src,
-            )
+            if use_catchment_zonal:
+                precip_df, temp_df = _build_catchment_prism(
+                    self.base_dir,
+                    prism_geom,
+                    wy,
+                    prism_ppt_src,
+                    prism_tmean_src,
+                )
+            else:
+                precip_df, temp_df = _build_real_prism(
+                    self.base_dir,
+                    prism_geom[["ComID", "geometry"]].copy(),
+                    wy,
+                    prism_ppt_src,
+                    prism_tmean_src,
+                )
 
             with p_path.open("w", encoding="utf-8") as f:
                 f.write("PRISM precipitation\n")
-                f.write("Real basin raster-sampled dataset\n")
+                if use_catchment_zonal:
+                    f.write("Real basin catchment-zonal dataset\n")
+                else:
+                    f.write("Real basin raster-sampled dataset\n")
                 f.write("GridCode GCAreaSqMi PIn_01..PIn_13\n")
                 f.write("Units: source PRISM raster units\n")
                 precip_df.to_csv(f, index=False, header=False, sep=" ", float_format="%.6f")
 
             with t_path.open("w", encoding="utf-8") as f:
                 f.write("PRISM temperature\n")
-                f.write("Real basin raster-sampled dataset\n")
+                if use_catchment_zonal:
+                    f.write("Real basin catchment-zonal dataset\n")
+                else:
+                    f.write("Real basin raster-sampled dataset\n")
                 f.write("GridCode TdC_01..TdC_12\n")
                 f.write("Units: source PRISM raster units\n")
                 temp_df.to_csv(f, index=False, header=False, sep=" ", float_format="%.6f")
 
-        self.log("[Regression] Missing HSR PRISM yearly files generated.\n")
+        self.log("[Regression] HSR PRISM yearly files generated.\n")
 
     def _load(self, module_name: str, file_name: str):
         path = self.src_dir / file_name
@@ -390,6 +434,23 @@ class ConvertedAFinchPipeline:
             poa=None,
         )
         self.log(f"Network structure built: stations={len(self.ctx.stations)}\n")
+        contributor_counts = [
+            len(np.asarray(rec.get("ComID", [])))
+            for rec in self.ctx.afstruct.get(self.hsr_key, {}).get(0, {}).values()
+        ]
+        if contributor_counts:
+            counts_s = pd.Series(contributor_counts)
+            one_reach = int((counts_s <= 1).sum())
+            self.log(
+                "Loaded gaged contributors: "
+                f"min={int(counts_s.min()):,}, median={int(counts_s.median()):,}, "
+                f"max={int(counts_s.max()):,}, one-reach={one_reach:,}\n"
+            )
+            if one_reach == len(contributor_counts):
+                raise RuntimeError(
+                    "Step 1 loaded one-reach gaged catchments for every station. "
+                    "Run Build Network again and confirm the upstream gaged catchment verification passes."
+                )
 
         self.ctx.inflow = m["in"].read_in_flow_wy(
             base_dir=self.base_dir,
@@ -550,11 +611,9 @@ class ConvertedAFinchPipeline:
                 wy=wy_reg,
                 iy=0,
                 ny=1,
-                afstruct=self.ctx.afstruct if iy == 0 else None,
+                afstruct=None,
                 poa=None,
             )
-            if iy == 0:
-                self.ctx.afstruct = afstruct
 
             inflow = m["in"].read_in_flow_wy(
                 base_dir=self.base_dir,
@@ -835,6 +894,13 @@ class ConvertedAFinchPipeline:
             prompt_pvalues=lambda: (P_ENTER, P_REMOVE),
             make_plot=False,
         )
+        self._write_regression_diagnostics(
+            reg_mat=self.ctx.reg_poa.reg_mat,
+            reg_month=self.ctx.reg_poa.reg_month,
+            reg_var_name=self.ctx.reg_var_name,
+            wy1=wy1_for_reg,
+            ny=ny_for_reg,
+        )
 
         self.ctx.reg_hist = m["regwy"].regress_by_wy(
             reg_mat=self.ctx.reg_poa.reg_mat,
@@ -847,6 +913,50 @@ class ConvertedAFinchPipeline:
 
         self.log("Step 2 complete.\n")
         return self.ctx
+
+    def _write_regression_diagnostics(
+        self,
+        reg_mat: np.ndarray,
+        reg_month: list[Any],
+        reg_var_name: list[str],
+        wy1: int,
+        ny: int,
+    ) -> None:
+        diag_dir = self.base_dir / self.hsr_key / "Output" / "Diagnostics"
+        diag_dir.mkdir(parents=True, exist_ok=True)
+
+        cols = ["WY", "Station", "Month", "YAdjIncWY", *reg_var_name]
+        design = pd.DataFrame(reg_mat, columns=cols)
+        design["WY"] = design["WY"].astype(int)
+        design["Month"] = design["Month"].astype(int)
+        design_path = diag_dir / f"RegressionDesignMatrix_WY{wy1}_{wy1 + ny - 1}.csv"
+        design.to_csv(design_path, index=False)
+
+        rows = []
+        for im, month in enumerate(reg_month):
+            r2 = 1.0 - month.stats.SSresid / month.stats.SStotal if month.stats.SStotal != 0 else np.nan
+            selected = [name for name, keep in zip(reg_var_name, month.inmodel) if bool(keep)]
+            month_design = design[design["Month"] == im + 1]
+            y = pd.to_numeric(month_design["YAdjIncWY"], errors="coerce")
+            rows.append({
+                "Month": self.ctx.mo_name[im] if im < len(self.ctx.mo_name) else im + 1,
+                "N": int(y.notna().sum()),
+                "YMean": float(y.mean()),
+                "YStd": float(y.std()),
+                "YMin": float(y.min()),
+                "YMax": float(y.max()),
+                "SelectedVariables": ";".join(selected),
+                "NumVariables": int(month.stats.df0),
+                "DFE": int(month.stats.dfe),
+                "RMSE": float(month.stats.rmse),
+                "FStat": float(month.stats.fstat),
+                "PValue": float(month.stats.pval),
+                "R2": float(r2),
+            })
+
+        summary_path = diag_dir / f"RegressionMonthlySummary_WY{wy1}_{wy1 + ny - 1}.csv"
+        pd.DataFrame(rows).to_csv(summary_path, index=False)
+        self.log(f"Regression diagnostics written: {design_path.name}, {summary_path.name}\n")
 
     def step_estimate_incremental(self) -> ConvertedAFinchContext:
         if self.ctx.reg_poa is None or self.ctx.reg_hist is None:

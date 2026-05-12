@@ -143,14 +143,17 @@ def sta_basin_grid_comid_wy(
 
 			gc_i = np.asarray(rec_i["SBGridCode"])
 			gc_j = np.asarray(rec_j["SBGridCode"])
-			common = np.intersect1d(gc_i, gc_j)
+			if gc_i.size == 0 or gc_j.size == 0:
+				continue
 
-			if common.size > 0:
+			# Only treat j as downstream of i when i is truly nested in j.
+			# Using any overlap over-connects peer basins and can produce
+			# invalid negative incremental drainage areas.
+			if np.all(np.isin(gc_i, gc_j)):
 				net_design[js_local, is_local] = 1.0
 
-				# Remove overlap from downstream/lower basin (MATLAB setxor behavior).
-				unique_j = np.setxor1d(gc_j, gc_i)
-				keep_mask = np.isin(gc_j, unique_j)
+				# Remove upstream cells from downstream incremental basin.
+				keep_mask = ~np.isin(gc_j, gc_i)
 				rec_j["SBGridCode"] = np.asarray(rec_j["SBGridCode"])[keep_mask]
 				rec_j["SBComID"] = np.asarray(rec_j["SBComID"])[keep_mask]
 				rec_j["SBAreaSqKm"] = np.asarray(rec_j["SBAreaSqKm"])[keep_mask]

@@ -104,6 +104,8 @@ def main() -> None:
         cfg["prism_tmean_dir"],
     ]
 
+    if cfg.get("hu4s"):
+        build_cmd += ["--hu4s", cfg["hu4s"]]
     if cfg.get("gages_csv"):
         build_cmd += ["--gages-csv", cfg["gages_csv"]]
     if cfg.get("wam_csv"):

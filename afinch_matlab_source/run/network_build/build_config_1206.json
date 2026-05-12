@@ -1,0 +1,17 @@
+{
+  "base_dir": "..\\..\\..",
+  "ths": "1206",
+  "hsr": "HSR1206",
+  "hu4s": "1206",
+  "build_wy": 2018,
+  "basin_shp": "afinch_matlab_source/input_data/basin/TWDB_MRBs_2014.shp",
+  "basin_field": "basin_name",
+  "basin_value": "Brazos",
+  "gdb_root": "afinch_matlab_source/input_data/nhd/_extracted_gdb",
+  "nlcd_raster": "afinch_matlab_source/input_data/nlcd/Annual_NLCD_LndCov_2018_CU_C1V1.tif",
+  "prism_ppt_dir": "afinch_matlab_source/input_data/prism/precipitation/extracted",
+  "prism_tmean_dir": "afinch_matlab_source/input_data/prism/temperature/extracted",
+  "gages_csv": "afinch_matlab_source/input_data/gages/monthly_wide_cfs.csv",
+  "wam_csv": "NONE",
+  "catchment_gpkg": "afinch_matlab_source/input_data/nhd/NHDPlusCatchment_1200.gpkg"
+}
