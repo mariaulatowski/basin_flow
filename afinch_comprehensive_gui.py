@@ -1119,8 +1119,9 @@ class AFinchComprehensiveGUI:
                 self._log(f"✓ {msg}\n", "ok")
                 self.root.after(0, lambda: self._export_status.configure(text=f"✓ Written: {out_shp}"))
             except Exception as exc:
-                self._log(f"ERROR: {exc}\n", "err")
-                self.root.after(0, lambda: self._export_status.configure(text=f"✗ Error: {exc}"))
+                err_text = str(exc)
+                self._log(f"ERROR: {err_text}\n", "err")
+                self.root.after(0, lambda msg=err_text: self._export_status.configure(text=f"✗ Error: {msg}"))
             finally:
                 self.root.after(0, lambda: self._set_running(False))
 
@@ -1165,9 +1166,30 @@ class AFinchComprehensiveGUI:
         except Exception:
             flow_df = pd.read_csv(flow_file)
 
-        # Identify ComID column (first column) and month columns
+        # AFConFlowAccum outputs comma-delimited ComIDQ12yyyy.csv with headers like
+        # ComID,QAccConOct,...,QAccConSep. If whitespace parsing collapses into one
+        # string column, re-read with the default comma delimiter.
+        if flow_df.shape[1] == 1:
+            only_col = str(flow_df.columns[0])
+            if "," in only_col:
+                flow_df = pd.read_csv(flow_file, comment="#")
+
+        if flow_df.shape[1] < 2:
+            raise RuntimeError(
+                f"Unable to parse accumulated flow file columns from {flow_file}. "
+                "Expected ComID plus 12 monthly flow columns."
+            )
+
+        # Identify ComID-like key column and month columns
         cols = list(flow_df.columns)
-        comid_col = cols[0]
+        comid_col = next(
+            (
+                c
+                for c in ["ComID", "COMID", "ComIDVAA", "ComIDVaa", "Comid"]
+                if c in cols
+            ),
+            cols[0],
+        )
         flow_df[comid_col] = pd.to_numeric(flow_df[comid_col], errors="coerce").astype("Int64")
         flow_df = flow_df.dropna(subset=[comid_col]).copy()
 
@@ -1229,11 +1251,64 @@ class AFinchComprehensiveGUI:
 
         geom_gdf["ComID"] = pd.to_numeric(geom_gdf["ComID"], errors="coerce").astype("Int64")
         geom_gdf = geom_gdf.dropna(subset=["ComID"])
-        modeled_comids = set(pd.to_numeric(flow_df[comid_col], errors="coerce").dropna().astype("int64").tolist())
+        flow_df = flow_df.copy()
+        flow_df["ModelComID"] = pd.to_numeric(flow_df[comid_col], errors="coerce").astype("Int64")
+        flow_df = flow_df.dropna(subset=["ModelComID"])
+
+        def _norm_reach(series: pd.Series) -> pd.Series:
+            return (
+                series.astype(str)
+                .str.strip()
+                .str.replace(r"\.0$", "", regex=True)
+                .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+            )
+
+        modeled_comids = set(flow_df["ModelComID"].astype("int64").tolist())
         before_filter = len(geom_gdf)
-        geom_gdf = geom_gdf[geom_gdf["ComID"].astype("int64").isin(modeled_comids)].copy()
+        direct = geom_gdf[geom_gdf["ComID"].astype("int64").isin(modeled_comids)].copy()
+        join_mode = "comid"
+
+        if direct.empty:
+            if not catchment_gpkg.exists():
+                raise RuntimeError(
+                    "No matching ComIDs between modeled flow output and selected geometry source, "
+                    "and no catchment crosswalk file is available for ReachCode fallback."
+                )
+
+            crosswalk = gpd.read_file(catchment_gpkg, columns=["NHDPlusID", "OrigReachCode"])
+            crosswalk = crosswalk.rename(columns={"NHDPlusID": "ModelComID"})
+            crosswalk["ModelComID"] = pd.to_numeric(crosswalk["ModelComID"], errors="coerce").astype("Int64")
+            crosswalk["OrigReachCode"] = _norm_reach(crosswalk["OrigReachCode"])
+            crosswalk = crosswalk.dropna(subset=["ModelComID", "OrigReachCode"]).drop_duplicates(subset=["ModelComID"])
+
+            flow_df = flow_df.merge(crosswalk[["ModelComID", "OrigReachCode"]], on="ModelComID", how="left")
+            flow_df["JoinKey"] = _norm_reach(flow_df["OrigReachCode"])
+            flow_df = flow_df.dropna(subset=["JoinKey"])
+
+            geom_reach_col = "REACHCODE" if "REACHCODE" in geom_gdf.columns else (
+                "ReachCode" if "ReachCode" in geom_gdf.columns else (
+                    "OrigReachCode" if "OrigReachCode" in geom_gdf.columns else None
+                )
+            )
+            if geom_reach_col is None:
+                raise RuntimeError(
+                    "No matching ComIDs between modeled flow output and geometry source, and geometry has "
+                    "no ReachCode field for fallback join."
+                )
+
+            geom_gdf["JoinKey"] = _norm_reach(geom_gdf[geom_reach_col])
+            geom_gdf = geom_gdf.dropna(subset=["JoinKey"])
+            matched_keys = set(flow_df["JoinKey"].tolist())
+            direct = geom_gdf[geom_gdf["JoinKey"].isin(matched_keys)].copy()
+            join_mode = "reachcode"
+            self._log("ComID direct match failed; using modeled ComID -> OrigReachCode flowline join.\n", "warn")
+        else:
+            flow_df["JoinKey"] = flow_df["ModelComID"].astype("int64").astype(str)
+            direct["JoinKey"] = direct["ComID"].astype("int64").astype(str)
+
+        geom_gdf = direct
         if geom_gdf.empty:
-            raise RuntimeError("No matching ComIDs between modeled flow output and geometry source.")
+            raise RuntimeError("No matching reaches between modeled flow output and geometry source.")
         if len(geom_gdf) < before_filter:
             self._log(f"Filtered geometry to modeled reaches: {len(geom_gdf):,} of {before_filter:,}\n")
 
@@ -1248,8 +1323,20 @@ class AFinchComprehensiveGUI:
             10: "Jul", 11: "Aug", 12: "Sep",
         }
 
-        out_df = geom_gdf[["ComID", "geometry"]].copy()
+        out_df = geom_gdf[["ComID", "geometry", "JoinKey"]].copy()
         out_df["ComID"] = out_df["ComID"].astype("int64")
+        if join_mode == "reachcode":
+            out_df = out_df.rename(columns={"ComID": "NHDCOMID"})
+            reach_to_model = (
+                flow_df[["JoinKey", "ModelComID"]]
+                .dropna()
+                .drop_duplicates(subset=["JoinKey"])
+                .rename(columns={"ModelComID": "COMID"})
+            )
+            out_df = out_df.merge(reach_to_model, on="JoinKey", how="left")
+            out_df["COMID"] = pd.to_numeric(out_df["COMID"], errors="coerce").astype("Int64")
+        else:
+            out_df = out_df.rename(columns={"ComID": "COMID"})
 
         for mo in months:
             if mo not in cfs_month_map:
@@ -1259,9 +1346,8 @@ class AFinchComprehensiveGUI:
             mo_label = WY_MONTH_NAMES.get(mo, f"M{mo:02d}")
             col_name = f"{wy}_{mo_label}_CFS"[:10]  # shapefile field limit 10 chars
 
-            mo_data = flow_df[[comid_col, src_col]].rename(columns={comid_col: "ComID", src_col: col_name})
-            mo_data["ComID"] = mo_data["ComID"].astype("int64")
-            out_df = out_df.merge(mo_data, on="ComID", how="left")
+            mo_data = flow_df[["JoinKey", src_col]].rename(columns={src_col: col_name})
+            out_df = out_df.merge(mo_data, on="JoinKey", how="left")
 
         # ── Validate that flow data merged successfully ────────────────────────
         cfs_cols = [c for c in out_df.columns if "CFS" in c]
@@ -1272,11 +1358,12 @@ class AFinchComprehensiveGUI:
                 if pct > 50:
                     self._log(
                         f"⚠ WARNING: {col} is {pct:.1f}% NaN. ComID merge may have failed.\n"
-                        f"  Geometry ComID range: {out_df['ComID'].min()} to {out_df['ComID'].max()}\n"
+                        f"  Geometry ComID range: {out_df['COMID'].min()} to {out_df['COMID'].max()}\n"
                         f"  Flow data ComID range: {flow_df[comid_col].min()} to {flow_df[comid_col].max()}\n",
                         "warn"
                     )
 
+        out_df = out_df.drop(columns=["JoinKey"])
         out_gdf = gpd.GeoDataFrame(out_df, geometry="geometry", crs=geom_gdf.crs)
 
         # Reproject to standard geographic CRS for ArcGIS compatibility
