@@ -46,7 +46,17 @@ def _read_station_list(station_list_path: Path) -> list[str]:
 			s = line.strip()
 			if s:
 				stations.append(s)
-	return stations
+
+	# Normalize float-formatted IDs written by older builds (e.g. '8126380.0' → '8126380')
+	# so that station names match the integer-formatted IDs in the streamflow files.
+	normalized = []
+	for s in stations:
+		try:
+			normalized.append(str(int(float(s))))
+		except ValueError:
+			normalized.append(s)
+	return normalized
+
 
 
 def _read_station_dat(station_dat_path: Path) -> StationCatchmentData:

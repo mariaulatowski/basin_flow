@@ -35,6 +35,8 @@ NLCD_CLASSES = [11, 12, 21, 22, 23, 31, 32, 33, 41, 42, 43, 51, 61, 71, 81, 82, 
 
 def _norm_station_id(v: object) -> str:
     s = str(v).strip()
+    if not s or s.lower() in {"nan", "none", "null", "nat"}:
+        return ""
     if s.endswith('.0'):
         s = s[:-2]
     return s.lstrip('0') or '0'
@@ -54,6 +56,15 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--basin-field", default="basin_name", help="Basin name field in the basin shapefile")
     parser.add_argument("--basin-value", default="Brazos", help="Basin name value to extract")
+    parser.add_argument(
+        "--basin-buffer-m",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional buffer distance in meters applied to the basin polygon for network selection "
+            "(HU4 discovery, flowline selection, and catchment selection)."
+        ),
+    )
     parser.add_argument(
         "--gdb-root",
         default="inputData/nhd_medium_res_gdb",
@@ -180,7 +191,14 @@ def _monthly_acft_to_cfs(acft: float, year: int, month: int) -> float:
 
 
 def _fetch_usgs_drainage_areas(stations: list[str]) -> dict[str, float]:
-    station_ids = sorted({_norm_station_id(s) for s in stations if str(s).strip()})
+    station_ids = sorted(
+        {
+            station_id
+            for s in stations
+            for station_id in [_norm_station_id(s)]
+            if station_id and station_id.isdigit()
+        }
+    )
     if not station_ids:
         return {}
 
@@ -263,6 +281,7 @@ def _build_streamflow_dat_from_gages_csv(
 
     src = src.copy()
     src["StationN"] = src[id_col].map(_norm_station_id)
+    src = src[src["StationN"] != ""].copy()
     src[year_col] = pd.to_numeric(src[year_col], errors="coerce")
     src = src[src[year_col] == float(wy)].copy()
     if src.empty:
@@ -307,6 +326,7 @@ def _build_streamflow_dat_from_gages_csv(
 
     sm = station_map.copy()
     sm["StationN"] = sm["Station"].map(_norm_station_id)
+    sm = sm[sm["StationN"] != ""].copy()
     sm = sm.drop_duplicates(subset=["StationN"], keep="first")
 
     work = sm.merge(src[["StationN", *month_cols.values()]], on="StationN", how="inner")
@@ -621,6 +641,15 @@ def _load_forced_hu4_polygon(base_dir: Path, gdb_root: str, forced_hu4s: str) ->
     return gpd.GeoDataFrame(pd.concat(mask_parts, ignore_index=True), geometry="geometry", crs=mask_parts[0].crs)
 
 
+def _buffer_polygon_meters(gdf: gpd.GeoDataFrame, buffer_m: float) -> gpd.GeoDataFrame:
+    if buffer_m <= 0:
+        return gdf
+    proj = gdf.to_crs(5070)
+    buffered = proj.copy()
+    buffered["geometry"] = proj.geometry.buffer(buffer_m)
+    return buffered.to_crs(gdf.crs)
+
+
 def _discover_hu4_gdbs(base_dir: Path, gdb_root: str, basin_gdf: gpd.GeoDataFrame, forced_hu4s: str) -> list[tuple[str, Path]]:
     root = (base_dir / gdb_root).resolve()
     if not root.exists():
@@ -685,11 +714,17 @@ def _load_selected_hu4_mask(hu4_gdbs: list[tuple[str, Path]], basin_gdf: gpd.Geo
     return gpd.GeoDataFrame({"geometry": [clipped]}, geometry="geometry", crs=basin_gdf.crs or mask.crs)
 
 
-def _load_basin_flowline_and_vaa(gdbs: list[tuple[str, Path]], basin_gdf: gpd.GeoDataFrame, ths: str) -> tuple[pd.DataFrame, pd.DataFrame, gpd.GeoDataFrame]:
+def _load_basin_flowline_and_vaa(
+    gdbs: list[tuple[str, Path]],
+    basin_gdf: gpd.GeoDataFrame,
+    ths: str,
+    basin_buffer_m: float = 0.0,
+) -> tuple[pd.DataFrame, pd.DataFrame, gpd.GeoDataFrame]:
     import warnings
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    basin_latlon = basin_gdf.to_crs(4269)
+    basin_sel = _buffer_polygon_meters(basin_gdf, basin_buffer_m)
+    basin_latlon = basin_sel.to_crs(4269)
     bbox = tuple(float(v) for v in basin_latlon.total_bounds)
 
     def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -893,11 +928,13 @@ def _load_basin_catchments(
     gdbs: list[tuple[str, Path]],
     basin_gdf: gpd.GeoDataFrame,
     flow_tbl: pd.DataFrame,
+    basin_buffer_m: float = 0.0,
 ) -> gpd.GeoDataFrame:
     import fiona
     import warnings
 
-    basin_latlon = basin_gdf.to_crs(4269)
+    basin_sel = _buffer_polygon_meters(basin_gdf, basin_buffer_m)
+    basin_latlon = basin_sel.to_crs(4269)
     bbox = tuple(float(v) for v in basin_latlon.total_bounds)
     valid_comids = set(flow_tbl["ComID"].astype("int64").tolist())
     parts: list[gpd.GeoDataFrame] = []
@@ -933,7 +970,11 @@ def _load_basin_catchments(
             continue
         if catch.crs is None:
             catch = catch.set_crs(basin_latlon.crs)
-        catch = gpd.clip(catch.to_crs(basin_latlon.crs), basin_latlon)
+        catch = catch.to_crs(basin_latlon.crs)
+        # Keep full catchment geometry when it intersects the selected polygon
+        # (including optional buffered extent) instead of clipping geometry.
+        sel_union = basin_latlon.geometry.union_all()
+        catch = catch[catch.geometry.intersects(sel_union)].copy()
         if catch.empty:
             continue
 
@@ -1211,6 +1252,24 @@ def main() -> None:
     da_path = sf_dir / "StationDASqMi.csv"
     catchment_gpkg = base_dir / "inputData" / f"NHDPlusCatchment_{args.ths}.gpkg"
     flowline_gpkg = base_dir / "inputData" / f"NHDFlowline_{args.ths}.gpkg"
+    static_output_paths = [
+        station_comid_path,
+        nhdflowline_path,
+        vaa_path,
+        nlcd_path,
+        wu_path,
+        catchment_gpkg,
+        flowline_gpkg,
+    ]
+    yearly_output_paths = [precip_path, temp_path, dat_path, da_path]
+
+    if args.apply and args.annual_only and all(path.exists() for path in yearly_output_paths):
+        print(f"Skipping WY{args.wy}; yearly outputs already exist.")
+        return
+
+    if args.apply and (not args.annual_only) and all(path.exists() for path in [*static_output_paths, *yearly_output_paths]):
+        print(f"Skipping full build for WY{args.wy}; static and yearly outputs already exist.")
+        return
 
     if args.annual_only:
         print(f"Running annual-only update for WY{args.wy} (static network files reused).")
@@ -1293,20 +1352,37 @@ def main() -> None:
     basin_shp_arg = str(args.basin_shp).strip()
     basin_shp_exists = bool(basin_shp_arg) and (base_dir / basin_shp_arg).resolve().exists()
 
+    if args.basin_buffer_m < 0:
+        raise ValueError("--basin-buffer-m must be >= 0")
+
     if str(args.hu4s).strip() and not basin_shp_exists:
         basin_gdf = _load_forced_hu4_polygon(base_dir, args.gdb_root, args.hu4s)
         print(f"Using HU4-only build extent from WBDHU4 polygons: {args.hu4s}")
     else:
         basin_gdf = _load_basin_polygon(base_dir, args.basin_shp, args.basin_field, args.basin_value)
-    hu4_gdbs = _discover_hu4_gdbs(base_dir, args.gdb_root, basin_gdf, args.hu4s)
+    basin_select_gdf = _buffer_polygon_meters(basin_gdf, args.basin_buffer_m)
+    if args.basin_buffer_m > 0:
+        print(f"Applying basin selection buffer: {args.basin_buffer_m:.1f} meters")
+
+    hu4_gdbs = _discover_hu4_gdbs(base_dir, args.gdb_root, basin_select_gdf, args.hu4s)
     hu4_codes = [code for code, _ in hu4_gdbs]
-    station_mask = _load_selected_hu4_mask(hu4_gdbs, basin_gdf)
+    station_mask = _load_selected_hu4_mask(hu4_gdbs, basin_select_gdf)
     print(f"Selected HU4 geodatabases: {', '.join(hu4_codes)}")
 
-    flow_tbl, vaa_tbl, flow_geom = _load_basin_flowline_and_vaa(hu4_gdbs, basin_gdf, args.ths)
+    flow_tbl, vaa_tbl, flow_geom = _load_basin_flowline_and_vaa(
+        hu4_gdbs,
+        basin_select_gdf,
+        args.ths,
+        basin_buffer_m=args.basin_buffer_m,
+    )
     comids = flow_tbl["ComID"].to_numpy(dtype=np.int64)
     print(f"Flowlines prepared: {len(flow_tbl):,} reaches")
-    catch_geom = _load_basin_catchments(hu4_gdbs, basin_gdf, flow_tbl)
+    catch_geom = _load_basin_catchments(
+        hu4_gdbs,
+        basin_select_gdf,
+        flow_tbl,
+        basin_buffer_m=args.basin_buffer_m,
+    )
     if not catch_geom.empty:
         print(f"Catchment polygons prepared: {len(catch_geom):,} polygons")
     else:

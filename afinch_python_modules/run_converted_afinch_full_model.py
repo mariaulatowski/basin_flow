@@ -86,6 +86,20 @@ def _station_y_adj_inc(q_adj_inc_wy: np.ndarray, nhd_area_iwy: np.ndarray, days_
     return y
 
 
+def _clip_negative_observed_yield(y_adj_inc_wy: np.ndarray, logger: Callable[[str], None] | None = None, context: str = "") -> np.ndarray:
+    """Enforce non-negative observed incremental water yield used in regression."""
+    y = np.asarray(y_adj_inc_wy, dtype=float).copy()
+    neg_mask = np.isfinite(y) & (y < 0.0)
+    n_neg = int(np.count_nonzero(neg_mask))
+    if n_neg > 0:
+        y[neg_mask] = 0.0
+        if logger is not None:
+            where = f" ({context})" if context else ""
+            logger(f"[Regression] Clipped {n_neg} negative observed YAdjIncWY values to 0{where}.\n")
+    y[~np.isfinite(y)] = 0.0
+    return y
+
+
 def _normalize_sta_ndx_for_year(sta_ndx: np.ndarray, year_block_len: int) -> np.ndarray:
     """Normalize station indices to zero-based for one year block.
 
@@ -217,14 +231,25 @@ class ConvertedAFinchPipeline:
     ) -> None:
         self.base_dir = Path(base_dir)
         self.src_dir = Path(src_dir)
+        self.log = logger or (lambda msg: None)
         self.ths = str(ths)
         self.hsr_key = str(hsr_key)
+        # Guard against GUI/config mismatches like ths=1206 with hsr_key=HSR1209.
+        # This mismatch causes station/catchment sources to come from different folders
+        # and produces empty regression station intersections.
+        if self.hsr_key.upper().startswith("HSR"):
+            hsr_tail = self.hsr_key[3:]
+            if hsr_tail.isdigit() and hsr_tail != self.ths:
+                self.log(
+                    f"[Config] WARNING: ths={self.ths} disagrees with hsr_key={self.hsr_key}; "
+                    f"using ths={hsr_tail} to match hsr_key.\n"
+                )
+                self.ths = hsr_tail
         self.wy1 = int(wy1)
         self.ny = int(ny)
         # Multi-year regression: use separate years if specified
         self.wy1_reg = int(wy1_reg) if wy1_reg is not None else int(wy1)
         self.ny_reg = int(ny_reg) if ny_reg is not None else int(ny)
-        self.log = logger or (lambda msg: None)
         self.ctx = ConvertedAFinchContext()
         # Store for multi-year regression loading
         self._prism_reg: Any = None
@@ -546,17 +571,22 @@ class ConvertedAFinchPipeline:
                     nlcd_vec = np.zeros(21, dtype=float)
             rec["NLCD"] = np.nan_to_num(nlcd_vec, nan=0.0, posinf=0.0, neginf=0.0)
 
+        y_obs_wy = _clip_negative_observed_yield(
+            _station_y_adj_inc(
+                self.ctx.plot_res.q_adj_inc_wy,
+                self.ctx.sta_res.sta_hist[0].nhd_area_iwy,
+                self.ctx.days_in_mo,
+            ),
+            logger=self.log,
+            context=f"WY{self.ctx.wy}",
+        )
         self.ctx.sta_hist_list = [{
             "StaList": self.ctx.sta_res.sta_list,
             "StaNdx": self.ctx.sta_res.sta_ndx,
             "NStaAct": self.ctx.sta_res.sta_hist[0].n_sta_act,
             "QTotWY": self.ctx.sta_res.sta_hist[0].q_tot_wy,
             "NHD_Area_IWY": np.asarray(self.ctx.sta_res.sta_hist[0].nhd_area_iwy, dtype=float),
-            "YAdjIncWY": _station_y_adj_inc(
-                self.ctx.plot_res.q_adj_inc_wy,
-                self.ctx.sta_res.sta_hist[0].nhd_area_iwy,
-                self.ctx.days_in_mo,
-            ),
+            "YAdjIncWY": y_obs_wy,
         }]
 
         self.log("Step 1 complete.\n")
@@ -663,10 +693,17 @@ class ConvertedAFinchPipeline:
                 n_reaches=len(self.ctx.nlcd.comid_ths),
             )
 
-            q_cols = [f"Q{i:02d}" for i in range(1, 14)]
-            q = inflow.station_flow_df[q_cols].to_numpy(dtype=float)
-            sta_wy = inflow.station_flow_df["StaWY"].astype(str).tolist()
-            nwis_area = inflow.station_flow_df["NWISArea"].to_numpy(dtype=float)
+            sdf = inflow.station_flow_df
+            self.log(
+                f"[Regression] WY{wy_reg} inflow: station_flow_df rows={len(sdf)}, "
+                f"stations_in_network={len(stations)}, "
+                f"poa_len={len(poa) if hasattr(poa, '__len__') else 'n/a'}, "
+                f"sta_wy_sample={list(sdf['StaWY'].astype(str).unique()[:5]) if len(sdf) > 0 else '[]'}\n"
+            )
+            q_cols_reg = [f"Q{i:02d}" for i in range(1, 14)]
+            q = sdf[q_cols_reg].to_numpy(dtype=float)
+            sta_wy = sdf["StaWY"].astype(str).tolist()
+            nwis_area = sdf["NWISArea"].to_numpy(dtype=float)
             comid_wu = inflow.comid_wu_df["ComID_WU"].to_numpy(dtype=np.int64)
 
             diag_dir = self.base_dir / self.hsr_key / "Output" / "Diagnostics"
@@ -727,6 +764,20 @@ class ConvertedAFinchPipeline:
             if q_adj_inc_wy is None:
                 nsta = len(sta_res.sta_ndx)
                 q_adj_inc_wy = np.zeros((nsta, 12), dtype=float)
+                self.log(
+                    f"[Regression] WARNING: WY{wy_reg} plot_res.q_adj_inc_wy is None "
+                    f"— YAdjIncWY will be all zeros for this year. "
+                    "Check that AFPlotAreasFlows returns q_adj_inc_wy when make_plots=False.\n"
+                )
+            else:
+                q_arr = np.asarray(q_adj_inc_wy, dtype=float)
+                finite_vals = q_arr[np.isfinite(q_arr)]
+                self.log(
+                    f"[Regression] WY{wy_reg} q_adj_inc_wy: shape={q_arr.shape}, "
+                    f"nonzero={int(np.count_nonzero(finite_vals))}/{finite_vals.size}, "
+                    f"min={float(finite_vals.min()) if finite_vals.size else float('nan'):.4g}, "
+                    f"max={float(finite_vals.max()) if finite_vals.size else float('nan'):.4g}\n"
+                )
 
             year_block = temp_res.afstruct[self.hsr_key][0]
             sta_ndx_reg = _align_sta_ndx_to_year_block(sta_res.sta_ndx, year_block)
@@ -773,13 +824,18 @@ class ConvertedAFinchPipeline:
                 else:
                     year_block[sidx] = rec
 
+            y_obs_wy = _clip_negative_observed_yield(
+                _station_y_adj_inc(q_adj_inc_wy, sta_res.sta_hist[0].nhd_area_iwy, days_in_mo_reg),
+                logger=self.log,
+                context=f"WY{wy_reg}",
+            )
             sta_hist = {
                 "StaList": sta_res.sta_list,
                 "StaNdx": sta_ndx_reg,
                 "NStaAct": sta_res.sta_hist[0].n_sta_act,
                 "QTotWY": sta_res.sta_hist[0].q_tot_wy,
                 "NHD_Area_IWY": np.asarray(sta_res.sta_hist[0].nhd_area_iwy, dtype=float),
-                "YAdjIncWY": _station_y_adj_inc(q_adj_inc_wy, sta_res.sta_hist[0].nhd_area_iwy, days_in_mo_reg),
+                "YAdjIncWY": y_obs_wy,
             }
             self._sta_hist_list_reg.append(sta_hist)
 
@@ -1053,7 +1109,7 @@ class ConvertedAFinchPipeline:
                     rows.append({
                         "WY": int(wy),
                         "MonthNum": int(im + 1),
-                        "Month": self.mo_name[im] if im < len(self.mo_name) else str(im + 1),
+                        "Month": self.ctx.mo_name[im] if im < len(self.ctx.mo_name) else str(im + 1),
                         "Station": str(station_ids[i]),
                         "ObservedYAdjInc": float(observed[i]),
                         "OLSPredYAdjInc": float(ols_pred[i]) if np.isfinite(ols_pred[i]) else np.nan,
@@ -1111,7 +1167,7 @@ class ConvertedAFinchPipeline:
                     reg_hist=reg_hist,
                     reg_month=reg_month,
                     reg_var_name=self.ctx.reg_var_name,
-                    month_name=self.month_name,
+                    month_name=self.ctx.month_name,
                     im=im,
                     hsr=self.hsr_key,
                     wy1=wy1,
@@ -1120,7 +1176,7 @@ class ConvertedAFinchPipeline:
                 )
                 if plt.fignum_exists(82):
                     fig82 = plt.figure(82)
-                    mo = self.mo_name[im] if im < len(self.mo_name) else f"M{im + 1:02d}"
+                    mo = self.ctx.mo_name[im] if im < len(self.ctx.mo_name) else f"M{im + 1:02d}"
                     fig82.savefig(plot_dir / f"RegressCoeff_{mo}_WY{wy1}_{wy1 + ny - 1}.png", dpi=200, bbox_inches="tight")
                     plt.close(fig82)
 
@@ -1133,8 +1189,45 @@ class ConvertedAFinchPipeline:
 
         self.log("[STEP 3/6] Estimating unconstrained incremental flow/yield...\n")
         p_cols = [f"PIn_{i:02d}" for i in range(1, 13)]
-        self.ctx.prsm_prec_ths = np.nan_to_num(self.ctx.prism.prism_ths[p_cols].to_numpy(dtype=float), nan=0.0).reshape(self.ny, -1, 12)
-        self.ctx.prsm_temp_ths = np.nan_to_num(self.ctx.temp_res.prsm_temp_ths, nan=0.0)
+
+        # Normalize PRISM precipitation matrix to (Ny, nTHS, 12), tolerating GUI/config Ny mismatches.
+        prsm_prec_raw = np.nan_to_num(self.ctx.prism.prism_ths[p_cols].to_numpy(dtype=float), nan=0.0)
+        if prsm_prec_raw.ndim != 2 or prsm_prec_raw.shape[1] != 12:
+            raise RuntimeError(
+                f"Unexpected PRISM precipitation shape for Step 3: {prsm_prec_raw.shape}; expected (nTHS, 12)."
+            )
+        if self.ny > 1 and (prsm_prec_raw.shape[0] % self.ny) == 0:
+            self.ctx.prsm_prec_ths = prsm_prec_raw.reshape(self.ny, -1, 12)
+        else:
+            if self.ny != 1:
+                self.log(
+                    f"[STEP 3] Warning: configured Ny={self.ny} but PRISM monthly rows={prsm_prec_raw.shape[0]} "
+                    "do not partition by Ny. Using single-year shape for estimation.\n"
+                )
+            self.ctx.prsm_prec_ths = prsm_prec_raw.reshape(1, -1, 12)
+
+        # Temperature from converted modules can be (nTHS, 12) or already (Ny, nTHS, 12).
+        prsm_temp_raw = np.nan_to_num(self.ctx.temp_res.prsm_temp_ths, nan=0.0)
+        if prsm_temp_raw.ndim == 2 and prsm_temp_raw.shape[1] == 12:
+            self.ctx.prsm_temp_ths = prsm_temp_raw.reshape(1, -1, 12)
+        elif prsm_temp_raw.ndim == 3 and prsm_temp_raw.shape[2] == 12:
+            self.ctx.prsm_temp_ths = prsm_temp_raw
+        else:
+            raise RuntimeError(
+                f"Unexpected PRISM temperature shape for Step 3: {prsm_temp_raw.shape}; expected (nTHS, 12) or (Ny, nTHS, 12)."
+            )
+
+        ny_inputs = min(self.ctx.prsm_prec_ths.shape[0], self.ctx.prsm_temp_ths.shape[0], len(self.ctx.reg_hist))
+        if ny_inputs < 1:
+            raise RuntimeError(
+                "Step 3 has no overlapping years across precipitation, temperature, and regression history."
+            )
+        if self.ctx.prsm_prec_ths.shape[0] != ny_inputs:
+            self.ctx.prsm_prec_ths = self.ctx.prsm_prec_ths[:ny_inputs, :, :]
+        if self.ctx.prsm_temp_ths.shape[0] != ny_inputs:
+            self.ctx.prsm_temp_ths = self.ctx.prsm_temp_ths[:ny_inputs, :, :]
+        reg_hist = self.ctx.reg_hist[:ny_inputs]
+
         self.ctx.prsm_prem_ths = m["lag"].gen_lag1_prec(prsm_prec_ths=self.ctx.prsm_prec_ths, p_in0=self.ctx.p_in0)
         self.ctx.gc_area_sq_mi = np.nan_to_num(
             pd.to_numeric(self.ctx.prism.prism_ths["GCAreaSqMi"], errors="coerce").to_numpy(dtype=float),
@@ -1143,6 +1236,12 @@ class ConvertedAFinchPipeline:
             neginf=1.0,
         )
 
+        n_ths = self.ctx.prsm_prec_ths.shape[1]
+        if self.ctx.gc_area_sq_mi.size != n_ths:
+            raise RuntimeError(
+                f"Step 3 area mismatch: GCAreaSqMi length={self.ctx.gc_area_sq_mi.size}, THS count={n_ths}."
+            )
+
         self.ctx.y_est_adj_inc, self.ctx.q_est_adj_inc = m["qest"].q_est_adj_inc(
             nlcd_ths=self.ctx.nlcd.nlcd_ths,
             prsm_prec_ths=self.ctx.prsm_prec_ths,
@@ -1150,7 +1249,7 @@ class ConvertedAFinchPipeline:
             prsm_prem_ths=self.ctx.prsm_prem_ths,
             cb_matrix=self.ctx.cb_matrix,
             reg_month=self.ctx.reg_poa.reg_month,
-            reg_hist=self.ctx.reg_hist,
+            reg_hist=reg_hist,
             gc_area_sq_mi=self.ctx.gc_area_sq_mi,
             days_in_mo=np.asarray(self.ctx.days_in_mo[:12], dtype=float),
         )

@@ -74,7 +74,7 @@ def regress_by_wy(
 			fig, axes = plt.subplots(4, 3, num=60 + iy, clear=True, figsize=figsize)
 			fig.canvas.manager.set_window_title(
 				f"Measured and Estimated Incremental Water Yields at Gaging Stations in WY {wy} "
-				"(red pluses are robust estimates, blue circles are OLS estimates)."
+				"(red x are robust estimates, blue circles are OLS estimates)."
 			)
 			axes = np.asarray(axes).reshape(4, 3)
 
@@ -148,8 +148,8 @@ def regress_by_wy(
 
 			if make_plots and axes is not None:
 				ax = axes[im // 3, im % 3]
-				ax.plot(y, entry.RobustPredRUAdj, "r+", linestyle="None")
-				ax.plot(y, entry.OLSPredRUAdj, "bo", linestyle="None", markersize=4)
+				ax.plot(y, entry.RobustPredRUAdj, "rx", linestyle="None", label="Robust estimate")
+				ax.plot(y, entry.OLSPredRUAdj, "bo", linestyle="None", markersize=4, label="OLS estimate")
 				ax.set_title(f"{month_name[im]} {wy}")
 				if im in (9, 10, 11):
 					ax.set_xlabel("Measured Water Yield")
@@ -166,11 +166,12 @@ def regress_by_wy(
 				ylim = ax.get_ylim()
 				lo = min(xlim[0], ylim[0]) + 0.1
 				hi = max(xlim[1], ylim[1]) - 0.1
-				ax.plot([lo, hi], [lo, hi], color="k")
+				ax.plot([lo, hi], [lo, hi], color="k", label="1:1 line")
 
 				y_lo_lim = ylim[0] + 0.10 * (ylim[1] - ylim[0])
 				x_up_lim = xlim[1] - 0.22 * (xlim[1] - xlim[0])
 				ax.text(x_up_lim, y_lo_lim, f"r_P^2= {rp2:6.4f}", fontsize=8, color="r")
+				ax.legend(loc="best", fontsize=7)
 
 		reg_hist.append(wy_entries)
 

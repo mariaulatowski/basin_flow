@@ -150,6 +150,7 @@ class AFinchComprehensiveGUI:
         self.v_basin_shp       = tk.StringVar()
         self.v_basin_field     = tk.StringVar(value="basin_name")
         self.v_basin_value     = tk.StringVar()
+        self.v_basin_buffer_m  = tk.StringVar(value="0")
         self.v_nhd_dir         = tk.StringVar()
         self.v_gages_csv       = tk.StringVar()
         self.v_wam_csv         = tk.StringVar()
@@ -272,6 +273,18 @@ class AFinchComprehensiveGUI:
             fg="#666",
             bg=PANEL,
         ).grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 0))
+
+        row_buf = tk.Frame(s1, bg=PANEL)
+        row_buf.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(3, 0))
+        tk.Label(row_buf, text="Basin Buffer (meters):", font=LABEL_FONT, bg=PANEL).pack(side="left", padx=(0, 6))
+        tk.Entry(row_buf, textvariable=self.v_basin_buffer_m, width=10, font=ENTRY_FONT).pack(side="left", padx=4)
+        tk.Label(
+            row_buf,
+            text="Used for shapefile builds to include nearby/edge catchments (0 = no buffer)",
+            font=SMALL_FONT,
+            fg="#666",
+            bg=PANEL,
+        ).pack(side="left", padx=8)
 
         # NHD source
         s2 = Section(outer, "NHD Flowline Source")
@@ -689,10 +702,14 @@ class AFinchComprehensiveGUI:
 
         def worker():
             try:
-                self._do_build_network(cfg, dry_run=dry_run)
+                build_result = self._do_build_network(cfg, dry_run=dry_run)
                 if not dry_run:
-                    self._do_build_upstream_gaged(cfg)
-                    self._verify_gaged_network(cfg)
+                    needs_upstream = build_result["static_built"] or not self._has_cached_gaged_network(cfg)
+                    if needs_upstream:
+                        self._do_build_upstream_gaged(cfg)
+                        self._verify_gaged_network(cfg)
+                    else:
+                        self._log("Skipping upstream gaged-catchment build; existing cached outputs found.\n", "ok")
                 status_msg = "✓ Build complete" if not dry_run else "✓ Dry run passed"
                 self._log_q.put(("status", ("build_ok", status_msg)))
             except Exception as exc:
@@ -704,7 +721,39 @@ class AFinchComprehensiveGUI:
         self._run_thread = threading.Thread(target=worker, daemon=True)
         self._run_thread.start()
 
-    def _do_build_network(self, cfg: dict, dry_run: bool):
+    def _network_static_artifacts(self, cfg: dict) -> list[Path]:
+        base = cfg["base_dir"]
+        hsr_dir = base / cfg["hsr"]
+        return [
+            hsr_dir / "Flowlines" / "StationComID.csv",
+            hsr_dir / "Flowlines" / "nhdflowline.txt",
+            hsr_dir / "GIS" / "NHDFlowlineVAA.txt",
+            hsr_dir / "NLCD" / "catchmentattributesnlcd.txt",
+            hsr_dir / "WaterUse" / "ComID_WU_All.dat",
+            base / "inputData" / f"NHDPlusCatchment_{cfg['ths']}.gpkg",
+            base / "inputData" / f"NHDFlowline_{cfg['ths']}.gpkg",
+        ]
+
+    def _network_year_artifacts(self, cfg: dict, wy: int) -> list[Path]:
+        hsr_dir = cfg["base_dir"] / cfg["hsr"]
+        return [
+            hsr_dir / "PRISM" / "Precipitation" / f"PrismPrecipWY{wy}.dat",
+            hsr_dir / "PRISM" / "Temperature" / f"PrismTempAveWY{wy}.dat",
+            hsr_dir / "Streamflow" / f"ComIDStationDAMoAnQ{wy}.dat",
+        ]
+
+    def _has_cached_gaged_network(self, cfg: dict) -> bool:
+        gaged_dir = cfg["base_dir"] / cfg["hsr"] / "GagedCatchments"
+        station_list_path = gaged_dir / "StationList.txt"
+        if not station_list_path.exists():
+            return False
+
+        stations = [s.strip() for s in station_list_path.read_text(encoding="utf-8").splitlines() if s.strip()]
+        if not stations:
+            return False
+        return all((gaged_dir / f"{station}.dat").exists() for station in stations)
+
+    def _do_build_network(self, cfg: dict, dry_run: bool) -> dict[str, Any]:
         base = cfg["base_dir"]
         builder_path = base / "afinch_python_modules" / "build_brazos_basin_network.py"
         if not builder_path.exists():
@@ -712,8 +761,19 @@ class AFinchComprehensiveGUI:
 
         build_years = list(range(cfg["build_wy_start"], cfg["build_wy_end"] + 1))
         self._log(f"Building network for years: {build_years}\n")
-        
-        for i, wy in enumerate(build_years):
+
+        static_ready = all(path.exists() for path in self._network_static_artifacts(cfg))
+        built_years: list[int] = []
+        skipped_years: list[int] = []
+        static_built = False
+
+        for wy in build_years:
+            year_outputs = self._network_year_artifacts(cfg, wy)
+            if not dry_run and all(path.exists() for path in year_outputs):
+                self._log(f"\n--- Skipping WY{wy}: existing yearly outputs found ---\n", "ok")
+                skipped_years.append(wy)
+                continue
+
             self._log(f"\n--- Building streamflow files for WY{wy} ---\n")
             cmd = [
                 sys.executable, str(builder_path),
@@ -731,6 +791,7 @@ class AFinchComprehensiveGUI:
                     "--basin-shp", cfg["basin_shp_rel"],
                     "--basin-field", cfg["basin_field"],
                     "--basin-value", cfg["basin_value"],
+                    "--basin-buffer-m", str(cfg["basin_buffer_m"]),
                 ]
             if cfg.get("hu4s"):
                 cmd += ["--hu4s", cfg["hu4s"]]
@@ -738,8 +799,9 @@ class AFinchComprehensiveGUI:
                 cmd += ["--gages-csv", cfg["gages_csv"]]
             if cfg.get("wam_csv"):
                 cmd += ["--wam-csv", cfg["wam_csv"]]
-            # Build static network once; subsequent years only refresh annual files.
-            if (not dry_run) and i > 0:
+
+            use_annual_only = static_ready
+            if use_annual_only:
                 cmd.append("--annual-only")
             if not dry_run:
                 cmd.append("--apply")
@@ -756,8 +818,24 @@ class AFinchComprehensiveGUI:
             rc = proc.wait()
             if rc != 0:
                 raise RuntimeError(f"Builder exited with code {rc} for WY{wy}")
-        
-        self._log(f"\nAll years {build_years} built successfully.\n")
+
+            built_years.append(wy)
+            if not use_annual_only:
+                static_built = True
+            static_ready = True
+
+        if built_years:
+            self._log(f"\nBuilt missing years: {built_years}\n", "ok")
+        if skipped_years:
+            self._log(f"Skipped existing years: {skipped_years}\n", "ok")
+        if not built_years and skipped_years:
+            self._log("All requested years already exist; no network rebuild needed.\n", "ok")
+
+        return {
+            "built_years": built_years,
+            "skipped_years": skipped_years,
+            "static_built": static_built,
+        }
 
     def _do_build_upstream_gaged(self, cfg: dict):
         """Generate upstream contributing catchments for USGS gages from VAA topology."""
@@ -902,6 +980,10 @@ class AFinchComprehensiveGUI:
         build_wy_end   = int(self.v_build_wy_end.get().strip())
         if build_wy_end < build_wy_start:
             raise ValueError("Build End WY must be ≥ Build Start WY")
+
+        basin_buffer_m = float(self.v_basin_buffer_m.get().strip() or "0")
+        if basin_buffer_m < 0:
+            raise ValueError("Basin buffer must be ≥ 0 meters")
         
         return {
             "base_dir":       base,
@@ -911,6 +993,7 @@ class AFinchComprehensiveGUI:
             "basin_shp_rel":  rel(basin_shp) if basin_shp is not None else "",
             "basin_field":    self.v_basin_field.get().strip(),
             "basin_value":    self.v_basin_value.get().strip(),
+            "basin_buffer_m": basin_buffer_m,
             "nhd_rel":        rel(nhd),
             "nlcd_rel":       rel(nlcd),
             "prism_ppt_rel":  rel(ppt),
