@@ -83,8 +83,18 @@ def con_flow_accum(
 	wu_comid = wu_df.iloc[:, 0].to_numpy(dtype=np.int64)
 	wu = wu_df.iloc[:, 1:13].to_numpy(dtype=float)
 
-	# Station-to-ComID lookup for diagnostics
-	station_map_path = base / f"{hsr[:5]}00" / "Flowlines" / "StationComID.csv"
+	# Station-to-ComID lookup for diagnostics.
+	# For numeric HSR codes (e.g. HSR1206) the MATLAB convention used a parent
+	# HU2 folder built from the first 5 chars + "00".  For custom THS strings
+	# (e.g. HC_region) that folder never exists; fall back to the HSR folder itself.
+	_hsr_tail = hsr[3:] if hsr.upper().startswith("HSR") else hsr
+	if _hsr_tail.isdigit():
+		_parent_folder = f"{hsr[:5]}00"
+	else:
+		_parent_folder = hsr
+	station_map_path = base / _parent_folder / "Flowlines" / "StationComID.csv"
+	if not station_map_path.exists():
+		station_map_path = base / hsr / "Flowlines" / "StationComID.csv"
 	stacomid_df = pd.read_csv(station_map_path)
 	hr_sta_id = stacomid_df.iloc[:, 0].astype(str).str.strip().to_numpy()
 	hr_comid = stacomid_df.iloc[:, 1].to_numpy(dtype=np.int64)
