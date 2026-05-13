@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import statsmodels.api as sm
 
@@ -171,12 +172,24 @@ def regress_by_wy(
 				y_lo_lim = ylim[0] + 0.10 * (ylim[1] - ylim[0])
 				x_up_lim = xlim[1] - 0.22 * (xlim[1] - xlim[0])
 				ax.text(x_up_lim, y_lo_lim, f"r_P^2= {rp2:6.4f}", fontsize=8, color="r")
-				ax.legend(loc="best", fontsize=7)
 
 		reg_hist.append(wy_entries)
 
 		if make_plots and fig is not None:
-			fig.tight_layout()
+			legend_handles = [
+				Line2D([0], [0], color="r", marker="x", linestyle="None", label="Robust estimate"),
+				Line2D([0], [0], color="b", marker="o", linestyle="None", markersize=4, label="OLS estimate"),
+				Line2D([0], [0], color="k", linestyle="-", label="1:1 line"),
+			]
+			fig.legend(
+				handles=legend_handles,
+				loc="lower center",
+				bbox_to_anchor=(0.5, 0.01),
+				ncol=3,
+				fontsize=8,
+				frameon=True,
+			)
+			fig.tight_layout(rect=(0.0, 0.07, 1.0, 1.0))
 			plt.show(block=False)
 
 	return reg_hist

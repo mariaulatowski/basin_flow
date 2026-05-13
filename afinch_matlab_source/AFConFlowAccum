@@ -25,6 +25,7 @@ def con_flow_accum(
 	sta_hist: Sequence[Dict[str, Any]],
 	month_name: Sequence[str],
 	plot_debug: bool = False,
+	enforce_nonnegative: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
 	"""Accumulate constrained adjusted flows through the NHDPlus network.
 
@@ -45,6 +46,9 @@ def con_flow_accum(
 		12-element month labels.
 	plot_debug:
 		Reserved flag for optional debug plotting (kept false by default).
+	enforce_nonnegative:
+		If true, clip negative accumulated monthly flows to zero before
+		diagnostics and output writing.
 
 	Returns
 	-------
@@ -126,6 +130,15 @@ def con_flow_accum(
 			else:
 				ndx = np.flatnonzero(to_node == from_node[ix])
 				flow_accum[ix, im] = float(np.sum(flow_accum[ndx, im]) + incre_flow_sorted[ix])
+
+		if enforce_nonnegative:
+			neg_mask = np.isfinite(flow_accum[:, im]) & (flow_accum[:, im] < 0.0)
+			n_neg = int(np.count_nonzero(neg_mask))
+			if n_neg > 0:
+				flow_accum[neg_mask, im] = 0.0
+				print(
+					f"[FlowAccum] WY{wy} {MONTH_ABBREV[im]} clipped {n_neg} negative accumulated flows to 0."
+				)
 
 		# Per-station diagnostics against measured monthly flows
 		sta_list = sta_hist[iy]["StaList"]

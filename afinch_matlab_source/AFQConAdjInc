@@ -24,6 +24,7 @@ def q_con_adj_inc(
 	q_est_adj_inc: np.ndarray,
 	gc_area_sq_mi: np.ndarray,
 	days_in_mo: np.ndarray,
+	enforce_nonnegative: bool = True,
 ) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
 	"""Constrain estimated incremental flows to measured station totals.
 
@@ -43,6 +44,8 @@ def q_con_adj_inc(
 		Catchment areas, shape ``(nTHS,)``.
 	days_in_mo:
 		Water-year month lengths, shape ``(12,)`` or larger.
+	enforce_nonnegative:
+		If true, clip negative constrained flow/yield values to zero.
 
 	Returns
 	-------
@@ -91,5 +94,9 @@ def q_con_adj_inc(
 				)
 
 			afstruct[hsr][iy][sta_ndx] = station
+
+	if enforce_nonnegative:
+		q_constrained = np.maximum(q_constrained, 0.0)
+		y_constrained = np.maximum(y_constrained, 0.0)
 
 	return afstruct, con_adjust, q_constrained, y_constrained
