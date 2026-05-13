@@ -597,12 +597,24 @@ def _load_basin_polygon(base_dir: Path, basin_shp: str, basin_field: str, basin_
         raise FileNotFoundError(basin_path)
 
     basin = gpd.read_file(basin_path)
-    if basin_field not in basin.columns:
-        raise KeyError(f"Missing basin field '{basin_field}' in {basin_path}")
+    field = str(basin_field or "").strip()
+    value = str(basin_value or "").strip()
 
-    basin = basin[basin[basin_field].astype(str).str.contains(basin_value, case=False, na=False)].copy()
-    if basin.empty:
-        raise ValueError(f"No basin polygons matched {basin_field}={basin_value!r}")
+    # If no attribute filter is provided, treat the shapefile as the direct basin mask.
+    if not field:
+        basin = basin.dropna(subset=["geometry"]).copy()
+        if basin.empty:
+            raise ValueError(f"No valid basin geometries found in {basin_path}")
+    else:
+        if field not in basin.columns:
+            raise KeyError(f"Missing basin field '{field}' in {basin_path}")
+
+        if value:
+            basin = basin[basin[field].astype(str).str.contains(value, case=False, na=False)].copy()
+        else:
+            basin = basin[basin[field].notna()].copy()
+        if basin.empty:
+            raise ValueError(f"No basin polygons matched {field}={value!r}")
     if basin.crs is None:
         basin = basin.set_crs("EPSG:4269")
     return basin
