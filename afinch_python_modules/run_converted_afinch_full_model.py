@@ -537,7 +537,7 @@ class ConvertedAFinchPipeline:
             ths=self.ths,
             hsr=self.hsr_key,
             wy=self.ctx.wy,
-            wy_n=self.ctx.wy,
+            wy_n=self.ctx.wy + self.ny - 1,
             iy=0,
             ny=self.ny,
             n_ths=len(self.ctx.nlcd.comid_ths),
