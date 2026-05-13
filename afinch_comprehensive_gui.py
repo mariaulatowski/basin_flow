@@ -1025,20 +1025,59 @@ class AFinchComprehensiveGUI:
         self.v_hsr_name.set(f"HSR{code}")
         self._log(f"Applied HU4 {code} -> THS={code}, HSR=HSR{code}\n", "ok")
 
+    def _resolve_hsr_key(self, base: Path, ths: str, raw_hsr: str) -> str:
+        """Resolve HSR folder key from user input and existing directories."""
+        entered = (raw_hsr or "").strip()
+        ths_val = (ths or "").strip()
+
+        candidates: list[str] = []
+
+        def add_candidate(name: str):
+            if name and name not in candidates:
+                candidates.append(name)
+
+        add_candidate(entered)
+        add_candidate(ths_val)
+
+        if entered.upper().startswith("HSR") and len(entered) > 3:
+            add_candidate(entered[3:])
+        if entered and not entered.upper().startswith("HSR"):
+            add_candidate(f"HSR{entered}")
+        if ths_val and not ths_val.upper().startswith("HSR"):
+            add_candidate(f"HSR{ths_val}")
+
+        for cand in candidates:
+            if (base / cand).exists():
+                if entered and cand != entered:
+                    self._log(
+                        f"Resolved HSR folder '{entered}' -> '{cand}' based on existing directories.\n",
+                        "warn",
+                    )
+                return cand
+
+        return entered or ths_val
+
     # ── Run Model ────────────────────────────────────────────────────────────
 
     def _validate_run_cfg(self) -> dict:
         base = Path(self.v_base_dir.get().strip())
         if not base.exists():
             raise FileNotFoundError(f"Base directory not found: {base}")
+        ths = self.v_ths_code.get().strip()
+        hsr_raw = self.v_hsr_name.get().strip()
+        hsr_key = self._resolve_hsr_key(base, ths, hsr_raw)
+        if not hsr_key:
+            raise ValueError("HSR Name is required (or provide THS so HSR can be inferred).")
+        self.v_hsr_name.set(hsr_key)
+
         wy_start = int(self.v_run_wy_start.get().strip())
         wy_end   = int(self.v_run_wy_end.get().strip())
         if wy_end < wy_start:
             raise ValueError("End WY must be ≥ Start WY")
         return {
             "base_dir": base,
-            "ths":      self.v_ths_code.get().strip(),
-            "hsr_key":  self.v_hsr_name.get().strip(),
+            "ths":      ths,
+            "hsr_key":  hsr_key,
             "wy_start": wy_start,
             "ny":       wy_end - wy_start + 1,
         }
@@ -1212,7 +1251,9 @@ class AFinchComprehensiveGUI:
                 return
 
         base = Path(self.v_base_dir.get().strip())
-        hsr_key = self.v_hsr_name.get().strip()
+        ths = self.v_ths_code.get().strip()
+        hsr_key = self._resolve_hsr_key(base, ths, self.v_hsr_name.get().strip())
+        self.v_hsr_name.set(hsr_key)
         try:
             wy = int(self.v_export_wy.get().strip())
         except ValueError:
