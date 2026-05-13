@@ -96,7 +96,7 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help=(
             "CSV of USGS gage stations to snap to reaches. "
-            "Required columns: Station (or Gage_ID_norm), LAT, LONG. "
+            "Required columns: Station (or Gage_ID/Gage_ID_norm), LAT, LONG. "
             "If omitted, falls back to inputData/inputs/monthly_wide_acft.csv (Brazos default)."
         ),
     )
@@ -257,8 +257,13 @@ def _build_streamflow_dat_from_gages_csv(
 
     src = pd.read_csv(gages_path)
 
-    id_col = next((c for c in src.columns if c in ("Gage_ID_norm", "Station", "station", "STATION", "CPID", "cpid")), None)
-    if id_col is None:
+    id_candidates = [
+        c for c in (
+            "Gage_ID_norm", "Gage_ID", "Station", "station", "STATION", "CPID", "cpid", "gage_id_norm", "gage_id"
+        )
+        if c in src.columns
+    ]
+    if not id_candidates:
         return pd.DataFrame()
 
     year_col = next((c for c in src.columns if str(c).lower() in ("year", "wy", "water_year")), None)
@@ -280,7 +285,11 @@ def _build_streamflow_dat_from_gages_csv(
             local_units = "cfs"
 
     src = src.copy()
-    src["StationN"] = src[id_col].map(_norm_station_id)
+    station_series = pd.Series("", index=src.index, dtype="object")
+    for id_col in id_candidates:
+        normalized = src[id_col].map(_norm_station_id)
+        station_series = station_series.where(station_series != "", normalized)
+    src["StationN"] = station_series
     src = src[src["StationN"] != ""].copy()
     src[year_col] = pd.to_numeric(src[year_col], errors="coerce")
     src = src[src[year_col] == float(wy)].copy()
@@ -312,17 +321,12 @@ def _build_streamflow_dat_from_gages_csv(
             if pd.notna(area) and float(area) > 0
         }
 
-    missing_for_api = sorted({s for s in src["StationN"].tolist() if s not in area_map})
-    if missing_for_api:
-        try:
-            fetched_map = _fetch_usgs_drainage_areas(missing_for_api)
-            area_map.update(fetched_map)
-            print(
-                f"Fetched USGS drainage area for {len(fetched_map):,} of {len(missing_for_api):,} stations "
-                f"from NWIS site metadata."
-            )
-        except Exception as exc:
-            print(f"WARNING: USGS drainage-area lookup failed; falling back where needed. {exc}")
+    missing_area = sorted({s for s in src["StationN"].tolist() if s not in area_map})
+    if missing_area:
+        print(
+            "WARNING: Drainage area missing in gages CSV for "
+            f"{len(missing_area):,} station(s); using default NWISArea=5.79 for those records."
+        )
 
     sm = station_map.copy()
     sm["StationN"] = sm["Station"].map(_norm_station_id)
@@ -1137,7 +1141,7 @@ def _load_station_points_flexible(
     Load gage station lat/long for reach-snapping.
 
     If ``gages_csv`` is provided it is used as the USGS/primary gage source.
-    Accepted column names: Station or Gage_ID_norm (id), LAT, LONG.
+    Accepted column names: Station or Gage_ID/Gage_ID_norm (id), LAT, LONG.
 
     If ``wam_csv`` is provided it is used as the WAM control-point source.
     Accepted column names: Station or CPID (id), LAT, LONG.
@@ -1157,16 +1161,24 @@ def _load_station_points_flexible(
 
     if primary_path.exists():
         df = pd.read_csv(primary_path, dtype=str)
-        # Flexible column detection for station id
-        id_col = next(
-            (c for c in df.columns if c in ("Station", "Gage_ID_norm", "STATION", "station")),
-            df.columns[0],
-        )
+        # Build station ID from the first non-empty value across common id columns.
+        id_candidates = [
+            c for c in (
+                "Station", "Gage_ID_norm", "Gage_ID", "STATION", "station", "gage_id_norm", "gage_id"
+            )
+            if c in df.columns
+        ]
+        if not id_candidates:
+            id_candidates = [df.columns[0]]
+        station_series = pd.Series("", index=df.index, dtype="object")
+        for id_col in id_candidates:
+            normalized = df[id_col].astype(str).apply(_normalize_station_id_local)
+            station_series = station_series.where(station_series != "", normalized)
         lat_col  = next((c for c in df.columns if c.upper() == "LAT"),  None)
         long_col = next((c for c in df.columns if c.upper() in ("LONG", "LON", "LONGITUDE")), None)
         if lat_col and long_col:
             src = pd.DataFrame({
-                "Station": df[id_col].astype(str).apply(_normalize_station_id_local),
+                "Station": station_series,
                 "LAT":  pd.to_numeric(df[lat_col],  errors="coerce"),
                 "LONG": pd.to_numeric(df[long_col], errors="coerce"),
                 "Source": "USGS",

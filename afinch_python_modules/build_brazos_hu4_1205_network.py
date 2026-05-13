@@ -119,10 +119,15 @@ def _load_station_points(base_dir: Path) -> pd.DataFrame:
     usgs_path = base_dir / "inputData" / "inputs" / "monthly_wide_acft.csv"
     wam_path = base_dir / "HSR1200" / "Streamflow" / "Brazos_new_wam_locations_nhdplus.csv"
 
-    usgs = pd.read_csv(usgs_path, dtype={"Gage_ID_norm": str})
+    usgs = pd.read_csv(usgs_path, dtype={"Gage_ID_norm": str, "Gage_ID": str})
+    station_series = pd.Series("", index=usgs.index, dtype="object")
+    for id_col in ["Gage_ID_norm", "Gage_ID"]:
+        if id_col in usgs.columns:
+            normalized = usgs[id_col].astype(str).map(_normalize_station_id)
+            station_series = station_series.where(station_series != "", normalized)
     usgs_pts = pd.DataFrame(
         {
-            "Station": usgs["Gage_ID_norm"].astype(str).map(_normalize_station_id),
+            "Station": station_series,
             "LAT": pd.to_numeric(usgs["LAT"], errors="coerce"),
             "LONG": pd.to_numeric(usgs["LONG"], errors="coerce"),
             "Source": "USGS",
