@@ -865,7 +865,7 @@ class AFinchComprehensiveGUI:
             "--hsr",
             cfg["hsr"],
             "--wy",
-            str(cfg["build_wy"]),
+            str(cfg["build_wy_start"]),
             "--catchment-gpkg",
             catchment_rel,
             "--apply",
