@@ -126,7 +126,18 @@ def gen_struc_data(
 	print("\nAFGenStrucData: Creating data structures for all gaging stations.")
 	print("Contains GridCode, ComID, AreaSqKm, and ReachCode sets for historically gaged basins.")
 
-	folder = base_dir / f"HSR{ths}" / "GagedCatchments"
+	# Prefer explicit HSR folder key, but keep legacy HSR{ths} fallback for older layouts.
+	folder_candidates = [
+		base_dir / str(hsr) / "GagedCatchments",
+		base_dir / str(ths) / "GagedCatchments",
+		base_dir / f"HSR{ths}" / "GagedCatchments",
+	]
+	folder = folder_candidates[0]
+	for cand in folder_candidates:
+		if (cand / "StationList.txt").exists():
+			folder = cand
+			break
+
 	station_list_path = folder / "StationList.txt"
 	stations = _read_station_list(station_list_path)
 	n_sta_ths = len(stations)
