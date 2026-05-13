@@ -121,7 +121,7 @@ def _load_station_points(base_dir: Path) -> pd.DataFrame:
 
     usgs = pd.read_csv(usgs_path, dtype={"Gage_ID_norm": str, "Gage_ID": str})
     station_series = pd.Series("", index=usgs.index, dtype="object")
-    for id_col in ["Gage_ID_norm", "Gage_ID"]:
+    for id_col in ["Gage_ID", "Gage_ID_norm"]:
         if id_col in usgs.columns:
             normalized = usgs[id_col].astype(str).map(_normalize_station_id)
             station_series = station_series.where(station_series != "", normalized)

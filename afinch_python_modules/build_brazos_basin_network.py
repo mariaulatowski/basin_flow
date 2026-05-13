@@ -302,6 +302,7 @@ def _build_streamflow_dat_from_gages_csv(
             c for c in src.columns
             if str(c).strip().lower() in {
                 "dasqmi",
+                "da_sqmi",
                 "drain_area_va",
                 "drainage_area",
                 "drainage_area_sqmi",
@@ -1176,7 +1177,7 @@ def _load_station_points_flexible(
         # Build station ID from the first non-empty value across common id columns.
         id_candidates = [
             c for c in (
-                "Station", "Gage_ID_norm", "Gage_ID", "STATION", "station", "gage_id_norm", "gage_id"
+                "Gage_ID", "Station", "Gage_ID_norm", "STATION", "station", "gage_id", "gage_id_norm"
             )
             if c in df.columns
         ]
@@ -1196,7 +1197,10 @@ def _load_station_points_flexible(
                 "Source": "USGS",
             }).dropna(subset=["LAT", "LONG"]).drop_duplicates(subset=["Station"], keep="first")
             parts.append(src)
-            print(f"Primary gages loaded: {len(src):,} stations from {primary_path.name}")
+            print(
+                f"Primary gages loaded: {len(src):,} stations from {primary_path.name} "
+                f"(ID priority: {', '.join(id_candidates)})"
+            )
         else:
             print(f"WARNING: Could not find LAT/LONG columns in {primary_path}. Available: {list(df.columns)}")
     else:
