@@ -1228,21 +1228,16 @@ class ConvertedAFinchPipeline:
         self.log("[STEP 3/6] Estimating unconstrained incremental flow/yield...\n")
         p_cols = [f"PIn_{i:02d}" for i in range(1, 13)]
 
-        # Normalize PRISM precipitation matrix to (Ny, nTHS, 12), tolerating GUI/config Ny mismatches.
+        # Normalize PRISM precipitation matrix to (1, nTHS, 12).
+        # self.ctx.prism is always loaded for a single analysis year in step 1 (one .dat file
+        # with nTHS rows), so the shape is always (nTHS, 12) and must be reshaped to (1, nTHS, 12).
+        # Do NOT reshape by self.ny — that would incorrectly split nTHS rows across ny years.
         prsm_prec_raw = np.nan_to_num(self.ctx.prism.prism_ths[p_cols].to_numpy(dtype=float), nan=0.0)
         if prsm_prec_raw.ndim != 2 or prsm_prec_raw.shape[1] != 12:
             raise RuntimeError(
                 f"Unexpected PRISM precipitation shape for Step 3: {prsm_prec_raw.shape}; expected (nTHS, 12)."
             )
-        if self.ny > 1 and (prsm_prec_raw.shape[0] % self.ny) == 0:
-            self.ctx.prsm_prec_ths = prsm_prec_raw.reshape(self.ny, -1, 12)
-        else:
-            if self.ny != 1:
-                self.log(
-                    f"[STEP 3] Warning: configured Ny={self.ny} but PRISM monthly rows={prsm_prec_raw.shape[0]} "
-                    "do not partition by Ny. Using single-year shape for estimation.\n"
-                )
-            self.ctx.prsm_prec_ths = prsm_prec_raw.reshape(1, -1, 12)
+        self.ctx.prsm_prec_ths = prsm_prec_raw.reshape(1, -1, 12)
 
         # Temperature from converted modules can be (nTHS, 12) or already (Ny, nTHS, 12).
         prsm_temp_raw = np.nan_to_num(self.ctx.temp_res.prsm_temp_ths, nan=0.0)
