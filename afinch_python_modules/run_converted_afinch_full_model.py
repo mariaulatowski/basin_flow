@@ -4,6 +4,7 @@ from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -174,6 +175,48 @@ def _pick_prism_source_dir(base_dir: Path, element: str) -> str:
     )
 
 
+def _resolve_catchment_gpkg(base_dir: Path, ths: str, hsr_key: str) -> Path:
+    """Resolve the best available NHDPlusCatchment geometry file.
+
+    Supports custom THS strings (for example, 'HC_region') by falling back to
+    HU4-like digits parsed from THS/HSR key.
+    """
+    input_dir = base_dir / "inputData"
+    candidates: list[Path] = []
+
+    def _add(code: str | None):
+        if not code:
+            return
+        p = input_dir / f"NHDPlusCatchment_{code}.gpkg"
+        if p not in candidates:
+            candidates.append(p)
+
+    ths_s = str(ths).strip()
+    hsr_s = str(hsr_key).strip()
+
+    _add(ths_s)
+
+    # Add 4+ digit tokens from THS and HSR (e.g., HSR1206 -> 1206).
+    for token in re.findall(r"\d{4,}", ths_s):
+        _add(token)
+    for token in re.findall(r"\d{4,}", hsr_s):
+        _add(token)
+
+    # Common HSR prefix form.
+    if hsr_s.upper().startswith("HSR") and len(hsr_s) > 3:
+        _add(hsr_s[3:])
+
+    for p in candidates:
+        if p.exists():
+            return p
+
+    detail = ", ".join(str(p) for p in candidates) if candidates else "(no candidates)"
+    raise FileNotFoundError(
+        "Missing catchment geometry required for PRISM build. "
+        f"Checked: {detail}. Run Build Network first."
+    )
+
+
 @dataclass
 class ConvertedAFinchContext:
     """Mutable state carried across the converted AFINCH step workflow."""
@@ -271,12 +314,7 @@ class ConvertedAFinchPipeline:
 
         # Geometry with ComID is produced by the network build step. New builds write
         # polygon NHDPlusCatchment geometry; older builds wrote flowline geometry.
-        catchment_gpkg = self.base_dir / "inputData" / f"NHDPlusCatchment_{self.ths}.gpkg"
-        if not catchment_gpkg.exists():
-            raise FileNotFoundError(
-                f"Missing catchment geometry required for PRISM build: {catchment_gpkg}. "
-                "Run Build Network first."
-            )
+        catchment_gpkg = _resolve_catchment_gpkg(self.base_dir, self.ths, self.hsr_key)
 
         gdf = gpd.read_file(catchment_gpkg)
         comid_col = None
