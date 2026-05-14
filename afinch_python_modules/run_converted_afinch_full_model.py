@@ -300,6 +300,9 @@ class ConvertedAFinchPipeline:
         self._p_in0_reg: np.ndarray | None = None
         self._sta_hist_list_reg: list[dict[str, Any]] = []
         self._temp_res_reg: Any = None
+        # Store for multi-year main model PRISM data
+        self._prism_list: list[Any] = []
+        self._p_in_list: list[np.ndarray] = []
 
     def _ensure_regression_prism_files(self) -> None:
         """Ensure HSR PRISM yearly files exist for all regression years.
@@ -474,22 +477,35 @@ class ConvertedAFinchPipeline:
         self.ctx.nlcd = m["nlcd"].read_nlcd(self.base_dir, self.ths, hsr=self.hsr_key)
         self.log(f"NLCD loaded: comids={len(self.ctx.nlcd.comid_ths)}\n")
 
-        self.ctx.prism = m["prec"].read_prism_prec(
-            base_dir=self.base_dir,
-            ths=self.ths,
-            hsr=self.hsr_key,
-            wy=self.ctx.wy,
-            comid_ths_flowline=self.ctx.nlcd.comid_ths,
-            gridcode_ths_nlcd=self.ctx.nlcd.gridcode_ths,
-        )
+        # Load PRISM data for all years in the model period
+        prism_list = []
+        p_in_list = []
+        for iy, wy_year in enumerate(range(self.wy1, self.wy1 + self.ny)):
+            prism = m["prec"].read_prism_prec(
+                base_dir=self.base_dir,
+                ths=self.ths,
+                hsr=self.hsr_key,
+                wy=wy_year,
+                comid_ths_flowline=self.ctx.nlcd.comid_ths,
+                gridcode_ths_nlcd=self.ctx.nlcd.gridcode_ths,
+            )
+            prism_list.append(prism)
+            p_cols = [f"PIn_{i:02d}" for i in range(1, 13)]
+            p_in = prism.prism_ths[p_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=float)
+            p_in_list.append(p_in)
+        
+        self.ctx.prism = prism_list[0]  # Keep first year for backward compatibility
         self.log(
-            f"PRISM loaded: rows={len(self.ctx.prism.prism_ths)} "
+            f"PRISM loaded: {len(prism_list)} years, rows/year={len(self.ctx.prism.prism_ths)} "
             f"unmatched_gridcodes={len(self.ctx.prism.unmatched_gridcodes)}\n"
         )
 
         p_cols = [f"PIn_{i:02d}" for i in range(1, 13)]
-        p_in = self.ctx.prism.prism_ths[p_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        p_in = p_in_list[0]  # First year for backward compatibility
         self.ctx.p_in0 = p_in.copy()
+        # Store all years' PRISM for later use
+        self._prism_list = prism_list
+        self._p_in_list = p_in_list
 
         self.ctx.afstruct, self.ctx.poa, self.ctx.stations = m["gen"].gen_struc_data(
             base_dir=self.base_dir,
@@ -520,30 +536,229 @@ class ConvertedAFinchPipeline:
                     "Run Build Network again and confirm the upstream gaged catchment verification passes."
                 )
 
+        # Load flow data and build station history for each year in the range
+        self.ctx.sta_hist_list = []
+        self.ctx.temp_res = None
+        temp_res_list = []
+        diag_dir = self.base_dir / self.hsr_key / "Output" / "Diagnostics"
+        grid_to_nlcd: dict[int, np.ndarray] = {
+            int(g): np.nan_to_num(np.asarray(v, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            for g, v in zip(self.ctx.nlcd.gridcode_ths, self.ctx.nlcd.nlcd_ths)
+        }
+        afstruct_years: list[Any] = []
+
+        # Process each year individually to build station history
+        for iy in range(self.ny):
+            wy_year = self.wy1 + iy
+
+            # Load flow data for this year
+            inflow = m["in"].read_in_flow_wy(
+                base_dir=self.base_dir,
+                ths=self.ths,
+                hsr=self.hsr_key,
+                wy=wy_year,
+                iy=1,
+                sta_ths=self.ctx.stations,
+                poa=self.ctx.poa,
+                comid_ths=self.ctx.nlcd.comid_ths,
+                n_reaches=len(self.ctx.nlcd.comid_ths),
+            )
+
+            q_cols = [f"Q{i:02d}" for i in range(1, 14)]
+            q = inflow.station_flow_df[q_cols].to_numpy(dtype=float)
+            sta_wy = inflow.station_flow_df["StaWY"].astype(str).tolist()
+            nwis_area = inflow.station_flow_df["NWISArea"].to_numpy(dtype=float)
+            comid_wu = inflow.comid_wu_df["ComID_WU"].to_numpy(dtype=np.int64)
+
+            # Build station network for this year
+            afstruct_for_year, poa_for_year, stations_for_year = m["gen"].gen_struc_data(
+                base_dir=self.base_dir,
+                ths=self.ths,
+                hsr=self.hsr_key,
+                wy=wy_year,
+                iy=0,
+                ny=1,
+                afstruct=None,
+                poa=None,
+            )
+
+            sta_res = m["sta"].sta_basin_grid_comid_wy(
+                afstruct=afstruct_for_year,
+                hsr=self.hsr_key,
+                ths=self.ths,
+                wy=wy_year,
+                iy=0,
+                sta_wy=sta_wy,
+                q=q,
+                nwis_area=nwis_area,
+                comid_wu=comid_wu,
+                comid_ths=self.ctx.nlcd.comid_ths,
+                reach_wu=inflow.reach_wu,
+                output_dir=diag_dir,
+                sta_hist=None,
+                plot_matrix=False,
+            )
+
+            plot_res = m["plot"].plot_areas_flows(
+                afstruct=sta_res.afstruct,
+                sta_hist=sta_res.sta_hist,
+                hsr=self.hsr_key,
+                iy=0,
+                wy=wy_year,
+                net_design=sta_res.net_design,
+                q_tot_wy=sta_res.sta_hist[0].q_tot_wy,
+                nhd_area_iwy=sta_res.sta_hist[0].nhd_area_iwy,
+                nwis_area_iwy=sta_res.sta_hist[0].nwis_area_iwy,
+                month_names=self.ctx.month_name,
+                make_plots=False,
+            )
+
+            # Load temperature and climate data for this year
+            temp_res = m["temp"].read_prism_temp(
+                base_dir=self.base_dir,
+                ths=self.ths,
+                hsr=self.hsr_key,
+                wy=wy_year,
+                wy_n=wy_year,
+                iy=0,
+                ny=1,
+                n_ths=len(self.ctx.nlcd.comid_ths),
+                sta_ndx=sta_res.sta_ndx,
+                grid_code_p_ths=self._prism_list[iy].prism_ths["GridCode"].to_numpy(dtype=np.int64),
+                comid_ths=self.ctx.nlcd.comid_ths,
+                nlcd_ths=self.ctx.nlcd.nlcd_ths,
+                p_in=self._p_in_list[iy],
+                afstruct=plot_res.afstruct,
+                output_dir=diag_dir,
+            )
+            temp_res_list.append(temp_res)
+            afstruct_years.append(temp_res.afstruct[self.hsr_key][0])
+
+            # Get station indices for this year
+            sta_ndx_year = sta_res.sta_ndx
+            year_block = temp_res.afstruct[self.hsr_key][0]
+
+            # Clean up finite values in temperature/climate data
+            for sidx in sta_ndx_year:
+                if isinstance(year_block, dict):
+                    rec_key = sidx if sidx in year_block else str(sidx)
+                    rec = year_block[rec_key]
+                else:
+                    rec_key = sidx
+                    rec = year_block[sidx]
+
+                rec["Precip"] = np.nan_to_num(
+                    np.asarray(rec.get("Precip", np.zeros(12)), dtype=float),
+                    nan=0.0, posinf=0.0, neginf=0.0,
+                )
+                rec["Temp"] = np.nan_to_num(
+                    np.asarray(rec.get("Temp", np.zeros(12)), dtype=float),
+                    nan=0.0, posinf=0.0, neginf=0.0,
+                )
+
+                nlcd_vec = np.asarray(rec.get("NLCD", np.zeros(21)), dtype=float)
+                if not np.isfinite(nlcd_vec).all():
+                    sb_codes = np.asarray(rec.get("SBGridCode", []), dtype=float)
+                    sb_codes = sb_codes[np.isfinite(sb_codes)].astype(int)
+                    candidates = [grid_to_nlcd[int(code)] for code in sb_codes if int(code) in grid_to_nlcd]
+                    if candidates:
+                        nlcd_vec = np.mean(np.vstack(candidates), axis=0)
+                    else:
+                        nlcd_vec = np.zeros(21, dtype=float)
+                rec["NLCD"] = np.nan_to_num(nlcd_vec, nan=0.0, posinf=0.0, neginf=0.0)
+
+                if isinstance(year_block, dict):
+                    year_block[rec_key] = rec
+                else:
+                    year_block[sidx] = rec
+
+            # Compute observed yield for this year
+            y_obs_wy = _clip_negative_observed_yield(
+                _station_y_adj_inc(
+                    plot_res.q_adj_inc_wy,
+                    sta_res.sta_hist[0].nhd_area_iwy,
+                    self.ctx.days_in_mo,
+                ),
+                logger=self.log,
+                context=f"WY{wy_year}",
+            )
+
+            # Append to station history list
+            self.ctx.sta_hist_list.append({
+                "StaList": sta_res.sta_list,
+                "StaNdx": sta_ndx_year,
+                "NStaAct": sta_res.sta_hist[0].n_sta_act,
+                "QTotWY": sta_res.sta_hist[0].q_tot_wy,
+                "NHD_Area_IWY": np.asarray(sta_res.sta_hist[0].nhd_area_iwy, dtype=float),
+                "YAdjIncWY": y_obs_wy,
+            })
+
+        # Combine all years' temperature data into single temp_res with multi-year afstruct
+        self.log(f"Loaded {len(self.ctx.sta_hist_list)} years of station history\n")
+        if temp_res_list:
+            combined_afstruct = {self.hsr_key: afstruct_years}
+            last_temp_res = temp_res_list[-1]
+            
+            # Stack temperature data from all years into (ny, nTHS, 12)
+            prsm_temp_ths_list = []
+            for temp_res in temp_res_list:
+                temp_data = getattr(temp_res, "prsm_temp_ths", None)
+                if temp_data is not None:
+                    temp_data = np.nan_to_num(np.asarray(temp_data, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+                    # Handle both (nTHS, 12) and (1, nTHS, 12) shapes
+                    if temp_data.ndim == 3 and temp_data.shape[0] == 1:
+                        prsm_temp_ths_list.append(temp_data[0])
+                    elif temp_data.ndim == 2:
+                        prsm_temp_ths_list.append(temp_data)
+                    else:
+                        # Unknown shape, skip this year
+                        self.log(f"[Warning] Unexpected prsm_temp_ths shape: {temp_data.shape}\n")
+            
+            if prsm_temp_ths_list:
+                combined_prsm_temp_ths = np.stack(prsm_temp_ths_list, axis=0)
+            else:
+                combined_prsm_temp_ths = getattr(last_temp_res, "prsm_temp_ths", None)
+            
+            self.ctx.temp_res = SimpleNamespace(
+                afstruct=combined_afstruct,
+                array_nlcd=getattr(last_temp_res, "array_nlcd", None),
+                prsm_prec=getattr(last_temp_res, "prsm_prec", None),
+                prsm_temp=getattr(last_temp_res, "prsm_temp", None),
+                prsm_temp_ths=combined_prsm_temp_ths,
+            )
+
+        # Keep first year's data structures for backward compatibility (legacy code may reference them)
         self.ctx.inflow = m["in"].read_in_flow_wy(
             base_dir=self.base_dir,
             ths=self.ths,
             hsr=self.hsr_key,
-            wy=self.ctx.wy,
+            wy=self.wy1,
             iy=1,
             sta_ths=self.ctx.stations,
             poa=self.ctx.poa,
             comid_ths=self.ctx.nlcd.comid_ths,
             n_reaches=len(self.ctx.nlcd.comid_ths),
         )
-
+        afstruct_yr0, _, _ = m["gen"].gen_struc_data(
+            base_dir=self.base_dir,
+            ths=self.ths,
+            hsr=self.hsr_key,
+            wy=self.wy1,
+            iy=0,
+            ny=1,
+            afstruct=None,
+            poa=None,
+        )
         q_cols = [f"Q{i:02d}" for i in range(1, 14)]
         q = self.ctx.inflow.station_flow_df[q_cols].to_numpy(dtype=float)
         sta_wy = self.ctx.inflow.station_flow_df["StaWY"].astype(str).tolist()
         nwis_area = self.ctx.inflow.station_flow_df["NWISArea"].to_numpy(dtype=float)
         comid_wu = self.ctx.inflow.comid_wu_df["ComID_WU"].to_numpy(dtype=np.int64)
-        diag_dir = self.base_dir / self.hsr_key / "Output" / "Diagnostics"
-
         self.ctx.sta_res = m["sta"].sta_basin_grid_comid_wy(
-            afstruct=self.ctx.afstruct,
+            afstruct=afstruct_yr0,
             hsr=self.hsr_key,
             ths=self.ths,
-            wy=self.ctx.wy,
+            wy=self.wy1,
             iy=0,
             sta_wy=sta_wy,
             q=q,
@@ -555,13 +770,12 @@ class ConvertedAFinchPipeline:
             sta_hist=None,
             plot_matrix=False,
         )
-
         self.ctx.plot_res = m["plot"].plot_areas_flows(
             afstruct=self.ctx.sta_res.afstruct,
             sta_hist=self.ctx.sta_res.sta_hist,
             hsr=self.hsr_key,
             iy=0,
-            wy=self.ctx.wy,
+            wy=self.wy1,
             net_design=self.ctx.sta_res.net_design,
             q_tot_wy=self.ctx.sta_res.sta_hist[0].q_tot_wy,
             nhd_area_iwy=self.ctx.sta_res.sta_hist[0].nhd_area_iwy,
@@ -569,63 +783,6 @@ class ConvertedAFinchPipeline:
             month_names=self.ctx.month_name,
             make_plots=False,
         )
-
-        self.ctx.temp_res = m["temp"].read_prism_temp(
-            base_dir=self.base_dir,
-            ths=self.ths,
-            hsr=self.hsr_key,
-            wy=self.ctx.wy,
-            wy_n=self.ctx.wy + self.ny - 1,
-            iy=0,
-            ny=self.ny,
-            n_ths=len(self.ctx.nlcd.comid_ths),
-            sta_ndx=self.ctx.sta_res.sta_ndx,
-            grid_code_p_ths=self.ctx.prism.prism_ths["GridCode"].to_numpy(dtype=np.int64),
-            comid_ths=self.ctx.nlcd.comid_ths,
-            nlcd_ths=self.ctx.nlcd.nlcd_ths,
-            p_in=p_in,
-            afstruct=self.ctx.plot_res.afstruct,
-            output_dir=diag_dir,
-        )
-
-        grid_to_nlcd: dict[int, np.ndarray] = {
-            int(g): np.nan_to_num(np.asarray(v, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-            for g, v in zip(self.ctx.nlcd.gridcode_ths, self.ctx.nlcd.nlcd_ths)
-        }
-
-        for sidx in self.ctx.sta_res.sta_ndx:
-            rec = self.ctx.temp_res.afstruct[self.hsr_key][0][int(sidx)]
-            rec["Precip"] = np.nan_to_num(np.asarray(rec.get("Precip", np.zeros(12)), dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-            rec["Temp"] = np.nan_to_num(np.asarray(rec.get("Temp", np.zeros(12)), dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-
-            nlcd_vec = np.asarray(rec.get("NLCD", np.zeros(21)), dtype=float)
-            if not np.isfinite(nlcd_vec).all():
-                sb_codes = np.asarray(rec.get("SBGridCode", []), dtype=float)
-                sb_codes = sb_codes[np.isfinite(sb_codes)].astype(int)
-                candidates = [grid_to_nlcd[int(code)] for code in sb_codes if int(code) in grid_to_nlcd]
-                if candidates:
-                    nlcd_vec = np.mean(np.vstack(candidates), axis=0)
-                else:
-                    nlcd_vec = np.zeros(21, dtype=float)
-            rec["NLCD"] = np.nan_to_num(nlcd_vec, nan=0.0, posinf=0.0, neginf=0.0)
-
-        y_obs_wy = _clip_negative_observed_yield(
-            _station_y_adj_inc(
-                self.ctx.plot_res.q_adj_inc_wy,
-                self.ctx.sta_res.sta_hist[0].nhd_area_iwy,
-                self.ctx.days_in_mo,
-            ),
-            logger=self.log,
-            context=f"WY{self.ctx.wy}",
-        )
-        self.ctx.sta_hist_list = [{
-            "StaList": self.ctx.sta_res.sta_list,
-            "StaNdx": self.ctx.sta_res.sta_ndx,
-            "NStaAct": self.ctx.sta_res.sta_hist[0].n_sta_act,
-            "QTotWY": self.ctx.sta_res.sta_hist[0].q_tot_wy,
-            "NHD_Area_IWY": np.asarray(self.ctx.sta_res.sta_hist[0].nhd_area_iwy, dtype=float),
-            "YAdjIncWY": y_obs_wy,
-        }]
 
         self.log("Step 1 complete.\n")
         return self.ctx
@@ -915,7 +1072,8 @@ class ConvertedAFinchPipeline:
             sta_hist_for_reg = self.ctx.sta_hist_list
             prism_for_reg = self.ctx.prism
             p_in0_for_reg = self.ctx.p_in0
-            self.log(f"[Regression] Using single year data: WY{wy1_for_reg}\n")
+            year_range_msg = f"WY{wy1_for_reg}" if ny_for_reg == 1 else f"WY{wy1_for_reg}-{wy1_for_reg + ny_for_reg - 1}"
+            self.log(f"[Regression] Using model run data: {year_range_msg}\n")
 
         # Validate structures before entering AFRegressPOA, which otherwise raises
         # opaque NoneType subscripting errors when a station/year entry is missing.
@@ -1000,10 +1158,18 @@ class ConvertedAFinchPipeline:
         p_cols = [f"PIn_{i:02d}" for i in range(1, 13)]
         reg_prsm_prec = self._prsm_prec_reg
         if reg_prsm_prec is None:
-            reg_prsm_prec = np.nan_to_num(
-                prism_for_reg.prism_ths[p_cols].to_numpy(dtype=float),
-                nan=0.0,
-            ).reshape(ny_for_reg, -1, 12)
+            # Use multi-year precipitation from Step 1 if available
+            if self._p_in_list and len(self._p_in_list) >= ny_for_reg:
+                # Stack stored multi-year precipitation data
+                reg_prsm_prec = np.stack(
+                    [np.nan_to_num(p_in, nan=0.0) for p_in in self._p_in_list[:ny_for_reg]], axis=0
+                )
+            else:
+                # Fallback: use first year only (for backward compatibility)
+                reg_prsm_prec = np.nan_to_num(
+                    prism_for_reg.prism_ths[p_cols].to_numpy(dtype=float),
+                    nan=0.0,
+                ).reshape(1, -1, 12)
         elif reg_prsm_prec.shape[0] != ny_for_reg:
             raise RuntimeError(
                 f"Regression precipitation years mismatch: got {reg_prsm_prec.shape[0]}, expected {ny_for_reg}."
@@ -1228,16 +1394,19 @@ class ConvertedAFinchPipeline:
         self.log("[STEP 3/6] Estimating unconstrained incremental flow/yield...\n")
         p_cols = [f"PIn_{i:02d}" for i in range(1, 13)]
 
-        # Normalize PRISM precipitation matrix to (1, nTHS, 12).
-        # self.ctx.prism is always loaded for a single analysis year in step 1 (one .dat file
-        # with nTHS rows), so the shape is always (nTHS, 12) and must be reshaped to (1, nTHS, 12).
-        # Do NOT reshape by self.ny — that would incorrectly split nTHS rows across ny years.
-        prsm_prec_raw = np.nan_to_num(self.ctx.prism.prism_ths[p_cols].to_numpy(dtype=float), nan=0.0)
-        if prsm_prec_raw.ndim != 2 or prsm_prec_raw.shape[1] != 12:
-            raise RuntimeError(
-                f"Unexpected PRISM precipitation shape for Step 3: {prsm_prec_raw.shape}; expected (nTHS, 12)."
-            )
-        self.ctx.prsm_prec_ths = prsm_prec_raw.reshape(1, -1, 12)
+        # Build PRISM precipitation matrix for all model years: (ny, nTHS, 12)
+        # Use _p_in_list if available (loaded in step 1 for all years), else use first year
+        if self._p_in_list:
+            prsm_prec_ths_list = [np.nan_to_num(p_in, nan=0.0) for p_in in self._p_in_list[:self.ny]]
+            self.ctx.prsm_prec_ths = np.stack(prsm_prec_ths_list, axis=0) if prsm_prec_ths_list else np.zeros((1, 1, 12))
+        else:
+            # Fallback: use first year only (for backward compatibility)
+            prsm_prec_raw = np.nan_to_num(self.ctx.prism.prism_ths[p_cols].to_numpy(dtype=float), nan=0.0)
+            if prsm_prec_raw.ndim != 2 or prsm_prec_raw.shape[1] != 12:
+                raise RuntimeError(
+                    f"Unexpected PRISM precipitation shape for Step 3: {prsm_prec_raw.shape}; expected (nTHS, 12)."
+                )
+            self.ctx.prsm_prec_ths = prsm_prec_raw.reshape(1, -1, 12)
 
         # Temperature from converted modules can be (nTHS, 12) or already (Ny, nTHS, 12).
         prsm_temp_raw = np.nan_to_num(self.ctx.temp_res.prsm_temp_ths, nan=0.0)
@@ -1260,6 +1429,8 @@ class ConvertedAFinchPipeline:
         if self.ctx.prsm_temp_ths.shape[0] != ny_inputs:
             self.ctx.prsm_temp_ths = self.ctx.prsm_temp_ths[:ny_inputs, :, :]
         reg_hist = self.ctx.reg_hist[:ny_inputs]
+        
+        self.log(f"Step 3 using {ny_inputs} years of precipitation/temperature data\n")
 
         self.ctx.prsm_prem_ths = m["lag"].gen_lag1_prec(prsm_prec_ths=self.ctx.prsm_prec_ths, p_in0=self.ctx.p_in0)
         self.ctx.gc_area_sq_mi = np.nan_to_num(
@@ -1317,25 +1488,31 @@ class ConvertedAFinchPipeline:
             raise RuntimeError("Step 4 must be completed before writing outputs.")
         m = self.ctx.modules
 
-        self.log("[STEP 5/6] Writing THS incremental flow/yield outputs...\n")
-        self.ctx.qy_path = m["wrt"].write_qy_est_con(
-            base_dir=self.base_dir,
-            hsr=self.hsr_key,
-            ths=self.ths,
-            iy=0,
-            wy1=self.wy1,
-            ny=self.ny,
-            grid_code_ths=self.ctx.nlcd.gridcode_ths,
-            comid_ths=self.ctx.nlcd.comid_ths,
-            gc_area_sq_mi=self.ctx.gc_area_sq_mi,
-            q_est_adj_inc=self.ctx.q_est_adj_inc,
-            y_est_adj_inc=self.ctx.y_est_adj_inc,
-            q_con_adj_inc=self.ctx.q_con_adj_inc,
-            y_con_adj_inc=self.ctx.y_con_adj_inc,
-            sta_ths=self.ctx.stations,
-            poa=self.ctx.poa,
-        )
-        self.log(f"Step 5 complete. Output: {self.ctx.qy_path}\n")
+        self.log(f"[STEP 5/6] Writing THS incremental flow/yield outputs for {self.ny} year(s)...\n")
+        qy_paths = []
+        for iy in range(self.ny):
+            wy = self.wy1 + iy
+            qy_path = m["wrt"].write_qy_est_con(
+                base_dir=self.base_dir,
+                hsr=self.hsr_key,
+                ths=self.ths,
+                iy=iy,
+                wy1=self.wy1,
+                ny=self.ny,
+                grid_code_ths=self.ctx.nlcd.gridcode_ths,
+                comid_ths=self.ctx.nlcd.comid_ths,
+                gc_area_sq_mi=self.ctx.gc_area_sq_mi,
+                q_est_adj_inc=self.ctx.q_est_adj_inc,
+                y_est_adj_inc=self.ctx.y_est_adj_inc,
+                q_con_adj_inc=self.ctx.q_con_adj_inc,
+                y_con_adj_inc=self.ctx.y_con_adj_inc,
+                sta_ths=self.ctx.stations,
+                poa=self.ctx.poa,
+            )
+            qy_paths.append(qy_path)
+            self.log(f"  WY{wy}: {qy_path.name}\n")
+        self.ctx.qy_path = qy_paths[0] if qy_paths else None
+        self.log(f"Step 5 complete. Wrote {len(qy_paths)} file(s).\n")
         return self.ctx
 
     def step_accumulate_flow(self) -> ConvertedAFinchContext:
@@ -1343,19 +1520,28 @@ class ConvertedAFinchPipeline:
             raise RuntimeError("Step 1 must be completed before flow accumulation.")
         m = self.ctx.modules
 
-        self.log("[STEP 6/6] Accumulating constrained flow through HydroSeq...\n")
+        self.log(f"[STEP 6/6] Accumulating constrained flow through HydroSeq for {self.ny} year(s)...\n")
         _ensure_vaa_for_accumulation(self.base_dir, self.hsr_key)
-        self.ctx.flow_comid, self.ctx.flow_accum = m["acc"].con_flow_accum(
-            base_dir=self.base_dir,
-            hsr=self.hsr_key,
-            iy=0,
-            wy1=self.wy1,
-            sta_hist=self.ctx.sta_hist_list,
-            month_name=self.ctx.month_name,
-            plot_debug=False,
-        )
-        self.ctx.flow_accum_path = self.base_dir / self.hsr_key / "Output" / "FlowAccum" / f"ComIDQ12WY{self.ctx.wy}.csv"
-        self.log(f"Step 6 complete. Output: {self.ctx.flow_accum_path}\n")
+        accum_paths = []
+        for iy in range(self.ny):
+            wy = self.wy1 + iy
+            self.log(f"  Accumulating WY{wy}...\n")
+            flow_comid, flow_accum = m["acc"].con_flow_accum(
+                base_dir=self.base_dir,
+                hsr=self.hsr_key,
+                iy=iy,
+                wy1=self.wy1,
+                sta_hist=self.ctx.sta_hist_list,
+                month_name=self.ctx.month_name,
+                plot_debug=False,
+            )
+            accum_path = self.base_dir / self.hsr_key / "Output" / "FlowAccum" / f"ComIDQ12WY{wy}.csv"
+            accum_paths.append(accum_path)
+            # Keep last year's arrays on ctx for downstream use
+            self.ctx.flow_comid = flow_comid
+            self.ctx.flow_accum = flow_accum
+        self.ctx.flow_accum_path = accum_paths[0] if accum_paths else None
+        self.log(f"Step 6 complete. Wrote {len(accum_paths)} file(s): WY{self.wy1}-WY{self.wy1 + self.ny - 1}\n")
         return self.ctx
 
     def run_all(self) -> ConvertedAFinchContext:

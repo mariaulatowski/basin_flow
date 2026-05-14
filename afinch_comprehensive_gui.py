@@ -59,6 +59,14 @@ STEP_LABELS = {
 
 STEP_DEPS = {2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6}
 
+# WY month → calendar month label (Oct=1 … Sep=12)
+WY_MONTH_NAMES = {
+    1: "Oct", 2: "Nov", 3: "Dec",
+    4: "Jan", 5: "Feb", 6: "Mar",
+    7: "Apr", 8: "May", 9: "Jun",
+    10: "Jul", 11: "Aug", 12: "Sep",
+}
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helper widgets
@@ -126,7 +134,7 @@ class StepIndicator(tk.Label):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class AFinchComprehensiveGUI:
-    VERSION = "2.0"
+    VERSION = "2.1"
 
     def __init__(self):
         self.root = tk.Tk()
@@ -141,7 +149,7 @@ class AFinchComprehensiveGUI:
         self._pipeline: Any = None
         self._pipeline_sig: tuple | None = None
         self._completed_steps: set[int] = set()
-        self._step_indicators: dict[int, Stepindicator] = {}
+        self._step_indicators: dict[int, StepIndicator] = {}
         self._step_btns: dict[int, tk.Button] = {}
 
         # ── State variables ──────────────────────────────────────────────────
@@ -169,12 +177,13 @@ class AFinchComprehensiveGUI:
         # Run Model
         self.v_run_wy_start    = tk.StringVar(value="2018")
         self.v_run_wy_end      = tk.StringVar(value="2018")
-        self.v_reg_wy_start    = tk.StringVar(value="2018")  # Regression calibration start
-        self.v_reg_ny          = tk.StringVar(value="15")     # Regression calibration years
+        self.v_reg_wy_start    = tk.StringVar(value="2018")
+        self.v_reg_ny          = tk.StringVar(value="15")
 
-        # Export
-        self.v_export_wy       = tk.StringVar(value="2018")
-        self.v_export_month    = tk.StringVar(value="1")
+        # Export  ← now start + end instead of single year
+        self.v_export_wy_start = tk.StringVar(value="2018")
+        self.v_export_wy_end   = tk.StringVar(value="2018")
+        self.v_export_month    = tk.StringVar(value="ALL")
         self.v_export_shp      = tk.StringVar()
 
         self._build_ui()
@@ -511,37 +520,55 @@ class AFinchComprehensiveGUI:
         outer = tk.Frame(self._tab_export, bg=PANEL)
         outer.pack(fill="both", expand=True, padx=4, pady=4)
 
-        note = Section(outer, "Step 7 · Export Accumulated Flow Shapefile for ArcGIS / QGIS")
+        note = Section(outer, "Step 7 · Export Accumulated Flow Shapefiles for ArcGIS / QGIS")
         note.pack(fill="x", padx=6, pady=(6, 0))
         info = (
-            "Creates a line shapefile of the NHD flowlines for your basin with monthly\n"
-            "accumulated flow values attached as attributes — one column per month.\n\n"
-            "Open the output .shp in ArcGIS Pro, ArcMap, or QGIS and visualize\n"
-            "flow by symbolizing on any month column (in CFS)."
+            "Creates two shapefiles covering all requested water years:\n\n"
+            "  • Flowlines shapefile  – NHD line features with monthly CFS columns\n"
+            "  • Catchments shapefile – NHDPlus polygon features with monthly CFS columns\n\n"
+            "Each column is named  YYYY_Mon_CFS  (e.g. 2018_Oct_CFS, 2019_Jan_CFS).\n"
+            "Open either .shp in ArcGIS Pro, ArcMap, or QGIS and symbolise on any column."
         )
         tk.Label(note, text=info, font=SMALL_FONT, justify="left", bg=PANEL, fg="#333").pack(anchor="w", padx=4, pady=4)
 
         s1 = Section(outer, "Export Options")
         s1.pack(fill="x", padx=6, pady=(6, 0))
 
+        # ── Year range row ────────────────────────────────────────────────────
         row0 = tk.Frame(s1, bg=PANEL)
-        row0.grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
-        tk.Label(row0, text="Water Year to Export:", font=LABEL_FONT, bg=PANEL).pack(side="left", padx=(0, 6))
-        tk.Entry(row0, textvariable=self.v_export_wy, width=8, font=ENTRY_FONT).pack(side="left", padx=(0, 20))
-        tk.Label(row0, text="Month (1-12, or ALL):", font=LABEL_FONT, bg=PANEL).pack(side="left", padx=(0, 6))
-        tk.Entry(row0, textvariable=self.v_export_month, width=8, font=ENTRY_FONT).pack(side="left")
-        tk.Label(row0, text=" (leave 'ALL' to export all 12 months as attributes)",
-                 font=SMALL_FONT, fg="#666", bg=PANEL).pack(side="left", padx=6)
+        row0.grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
 
+        tk.Label(row0, text="Start Water Year:", font=LABEL_FONT, bg=PANEL).pack(side="left", padx=(0, 4))
+        tk.Entry(row0, textvariable=self.v_export_wy_start, width=8, font=ENTRY_FONT).pack(side="left", padx=(0, 16))
+
+        tk.Label(row0, text="End Water Year:", font=LABEL_FONT, bg=PANEL).pack(side="left", padx=(0, 4))
+        tk.Entry(row0, textvariable=self.v_export_wy_end, width=8, font=ENTRY_FONT).pack(side="left", padx=(0, 20))
+
+        tk.Label(row0, text="Month (1-12 or ALL):", font=LABEL_FONT, bg=PANEL).pack(side="left", padx=(0, 4))
+        tk.Entry(row0, textvariable=self.v_export_month, width=6, font=ENTRY_FONT).pack(side="left")
+
+        tk.Label(
+            row0,
+            text="  ← 'ALL' exports all 12 months for every year in range",
+            font=SMALL_FONT, fg="#666", bg=PANEL,
+        ).pack(side="left", padx=6)
+
+        # ── Output path row ───────────────────────────────────────────────────
         BrowseRow(
-            s1, "Output Shapefile (.shp)", self.v_export_shp, 1, mode="savefile",
+            s1, "Output Shapefile Base (.shp)", self.v_export_shp, 1, mode="savefile",
             filetypes=[("Shapefile", "*.shp")],
-            tip="Path to write the output shapefile for ArcGIS"
+            tip="Base path; '_flowlines.shp' and '_catchments.shp' will be appended automatically"
         )
+        tk.Label(
+            s1,
+            text="Two files will be written: <name>_flowlines.shp  and  <name>_catchments.shp",
+            font=SMALL_FONT, fg="#666", bg=PANEL,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 0))
 
+        # ── Export button ─────────────────────────────────────────────────────
         self._export_btn = tk.Button(
             outer,
-            text="📂  Export Shapefile",
+            text="📂  Export Shapefiles (flowlines + catchments)",
             command=self._start_export,
             font=("Segoe UI", 10, "bold"), bg=ACCENT, fg="white", relief="flat", padx=18, pady=8
         )
@@ -627,7 +654,6 @@ class AFinchComprehensiveGUI:
         ]
 
         def pick_dir(element: str) -> str | None:
-            # Prefer clipped (Texas-only, smaller), then extracted (full US)
             for root in prism_roots:
                 for sub in ["clipped", "extracted"]:
                     d = root / element / sub
@@ -657,7 +683,6 @@ class AFinchComprehensiveGUI:
             gdf = gpd.read_file(shp)
             field = self.v_basin_field.get().strip()
             if field not in gdf.columns:
-                # Try to find a string column named 'basin_name', 'name', etc.
                 str_cols = list(gdf.select_dtypes(include=["object", "string"]).columns)
                 for cand in ["basin_name", "basin", "name", "riverbasin"]:
                     for col in str_cols:
@@ -747,7 +772,6 @@ class AFinchComprehensiveGUI:
         station_list_path = gaged_dir / "StationList.txt"
         if not station_list_path.exists():
             return False
-
         stations = [s.strip() for s in station_list_path.read_text(encoding="utf-8").splitlines() if s.strip()]
         if not stations:
             return False
@@ -860,26 +884,19 @@ class AFinchComprehensiveGUI:
         cmd = [
             sys.executable,
             str(script_path),
-            "--base-dir",
-            str(base),
-            "--hsr",
-            cfg["hsr"],
-            "--wy",
-            str(cfg["build_wy_start"]),
-            "--catchment-gpkg",
-            catchment_rel,
+            "--base-dir", str(base),
+            "--hsr",      cfg["hsr"],
+            "--wy",       str(cfg["build_wy_start"]),
+            "--catchment-gpkg", catchment_rel,
             "--apply",
         ]
 
         self._log("\nRunning upstream gaged-catchment build...\n", "ok")
         self._log(f"Command:\n  {' '.join(cmd)}\n")
         proc = subprocess.Popen(
-            cmd,
-            cwd=str(base),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            cmd, cwd=str(base),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
         )
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -984,24 +1001,24 @@ class AFinchComprehensiveGUI:
         basin_buffer_m = float(self.v_basin_buffer_m.get().strip() or "0")
         if basin_buffer_m < 0:
             raise ValueError("Basin buffer must be ≥ 0 meters")
-        
+
         return {
-            "base_dir":       base,
-            "ths":            self.v_ths_code.get().strip(),
-            "hsr":            self.v_hsr_name.get().strip(),
-            "hu4s":           hu4s,
-            "basin_shp_rel":  rel(basin_shp) if basin_shp is not None else "",
-            "basin_field":    self.v_basin_field.get().strip(),
-            "basin_value":    self.v_basin_value.get().strip(),
-            "basin_buffer_m": basin_buffer_m,
-            "nhd_rel":        rel(nhd),
-            "nlcd_rel":       rel(nlcd),
-            "prism_ppt_rel":  rel(ppt),
+            "base_dir":        base,
+            "ths":             self.v_ths_code.get().strip(),
+            "hsr":             self.v_hsr_name.get().strip(),
+            "hu4s":            hu4s,
+            "basin_shp_rel":   rel(basin_shp) if basin_shp is not None else "",
+            "basin_field":     self.v_basin_field.get().strip(),
+            "basin_value":     self.v_basin_value.get().strip(),
+            "basin_buffer_m":  basin_buffer_m,
+            "nhd_rel":         rel(nhd),
+            "nlcd_rel":        rel(nlcd),
+            "prism_ppt_rel":   rel(ppt),
             "prism_tmean_rel": rel(tmean),
-            "build_wy_start": build_wy_start,
-            "build_wy_end":   build_wy_end,
-            "gages_csv":      self.v_gages_csv.get().strip(),
-            "wam_csv":        "NONE" if self.v_usgs_only.get() else self.v_wam_csv.get().strip(),
+            "build_wy_start":  build_wy_start,
+            "build_wy_end":    build_wy_end,
+            "gages_csv":       self.v_gages_csv.get().strip(),
+            "wam_csv":         "NONE" if self.v_usgs_only.get() else self.v_wam_csv.get().strip(),
         }
 
     def _apply_hu4_to_ids(self):
@@ -1093,13 +1110,10 @@ class AFinchComprehensiveGUI:
 
         self._log(f"Loading pipeline from: {runner}\n")
         mod = self._load_module("afinch_gui_runner", runner)
-        # Use GUI-specified regression calibration years (or defaults if parsing fails).
         try:
             reg_wy_start = int(self.v_reg_wy_start.get().strip())
             reg_ny = int(self.v_reg_ny.get().strip())
         except (ValueError, AttributeError):
-            # Fallback: use pipeline defaults for regression calibration years (typically multi-year),
-            # then fall back to the modeled run window if defaults are unavailable.
             reg_wy_start = int(getattr(mod, "WY1_REG", cfg["wy_start"]))
             reg_ny = int(getattr(mod, "NY_REG", cfg["ny"]))
         self._pipeline = mod.ConvertedAFinchPipeline(
@@ -1247,50 +1261,94 @@ class AFinchComprehensiveGUI:
             messagebox.showwarning("Busy", "Another operation is in progress.")
             return
         if 6 not in self._completed_steps:
-            if not messagebox.askyesno("Step 6 not run", "Step 6 (Accumulate Flow) hasn't been run this session.\nExport will use the most recent HSR output files. Continue?"):
+            if not messagebox.askyesno(
+                "Step 6 not run",
+                "Step 6 (Accumulate Flow) hasn't been run this session.\n"
+                "Export will use the most recent HSR output files. Continue?"
+            ):
                 return
 
         base = Path(self.v_base_dir.get().strip())
         ths = self.v_ths_code.get().strip()
         hsr_key = self._resolve_hsr_key(base, ths, self.v_hsr_name.get().strip())
         self.v_hsr_name.set(hsr_key)
+
+        # ── Parse year range ──────────────────────────────────────────────────
         try:
-            wy = int(self.v_export_wy.get().strip())
+            wy_start = int(self.v_export_wy_start.get().strip())
+            wy_end   = int(self.v_export_wy_end.get().strip())
         except ValueError:
-            messagebox.showerror("Input Error", "Water Year must be an integer.")
+            messagebox.showerror("Input Error", "Water Years must be integers.")
+            return
+        if wy_end < wy_start:
+            messagebox.showerror("Input Error", "End Water Year must be ≥ Start Water Year.")
             return
 
-        month_str = self.v_export_month.get().strip().upper()
-        months_to_export = list(range(1, 13)) if month_str == "ALL" else [int(month_str)]
+        years_to_export = list(range(wy_start, wy_end + 1))
 
+        # ── Parse month selection ─────────────────────────────────────────────
+        month_str = self.v_export_month.get().strip().upper()
+        if month_str == "ALL":
+            months_to_export = list(range(1, 13))
+        else:
+            try:
+                months_to_export = [int(month_str)]
+            except ValueError:
+                messagebox.showerror("Input Error", "Month must be an integer 1-12 or 'ALL'.")
+                return
+
+        # ── Auto-generate output base path if blank ───────────────────────────
         out_shp = self.v_export_shp.get().strip()
         if not out_shp:
-            # Auto-generate path
             hsr_out = base / hsr_key / "Output"
             hsr_out.mkdir(parents=True, exist_ok=True)
-            out_shp = str(hsr_out / f"accumulated_flow_WY{wy}.shp")
+            year_tag = f"WY{wy_start}" if wy_start == wy_end else f"WY{wy_start}-{wy_end}"
+            out_shp = str(hsr_out / f"accumulated_flow_{year_tag}.shp")
             self.v_export_shp.set(out_shp)
 
-        self._log(f"\n=== STEP 7: EXPORT SHAPEFILES (FLOWLINES + CATCHMENTS) ===\n", "ok")
+        year_tag = f"WY{wy_start}" if wy_start == wy_end else f"WY{wy_start}-{wy_end}"
+        self._log(f"\n=== STEP 7: EXPORT SHAPEFILES ({year_tag}, {len(months_to_export)} month(s)) ===\n", "ok")
         self._set_running(True)
 
         def worker():
             try:
-                flowline_out, catchment_out = self._do_export_shapefile(base, hsr_key, wy, months_to_export, Path(out_shp))
-                msg = f"Shapefiles written:\n  Flowlines: {flowline_out}\n  Catchments: {catchment_out}"
+                flowline_out, catchment_out = self._do_export_shapefile(
+                    base, hsr_key, years_to_export, months_to_export, Path(out_shp)
+                )
+                msg = f"Shapefiles written:\n  Flowlines:  {flowline_out}\n  Catchments: {catchment_out}"
                 self._log(f"✓ {msg}\n", "ok")
-                self.root.after(0, lambda: self._export_status.configure(text=f"✓ Written: flowlines + catchments for WY{wy}"))
+                self.root.after(0, lambda: self._export_status.configure(
+                    text=f"✓ Written: flowlines + catchments for {year_tag}"
+                ))
             except Exception as exc:
                 err_text = str(exc)
                 self._log(f"ERROR: {err_text}\n", "err")
-                self.root.after(0, lambda msg=err_text: self._export_status.configure(text=f"✗ Error: {msg}"))
+                self.root.after(0, lambda msg=err_text: self._export_status.configure(
+                    text=f"✗ Error: {msg}"
+                ))
             finally:
                 self.root.after(0, lambda: self._set_running(False))
 
         self._run_thread = threading.Thread(target=worker, daemon=True)
         self._run_thread.start()
 
-    def _do_export_shapefile(self, base: Path, hsr_key: str, wy: int, months: list[int], out_shp: Path):
+    def _do_export_shapefile(
+        self,
+        base: Path,
+        hsr_key: str,
+        years: list[int],
+        months: list[int],
+        out_shp: Path,
+    ):
+        """
+        Build and write two shapefiles (flowlines + catchments) containing monthly
+        accumulated flow for every year in `years`.
+
+        Output columns are named  YYYY_Mon_CFS  (e.g. 2018_Oct_CFS).
+        Because ESRI Shapefile field names are limited to 10 characters, each name
+        is truncated to 10 chars, which fits exactly (4 + 1 + 3 + 1 + 3 = 12 → use
+        two-char month abbreviation if needed, but 3-char fits within 10).
+        """
         try:
             import geopandas as gpd
             import pandas as pd
@@ -1305,76 +1363,103 @@ class AFinchComprehensiveGUI:
             base / "inputData" / f"NHDFlowline_{ths}.gpkg",
         ]
 
-        # Derive two output paths from the user-provided base path.
+        # Derive two output paths from the user-provided base path
         base_stem = out_shp.stem
         parent = out_shp.parent
-        flowline_out = parent / f"{base_stem}_flowlines.shp"
+        flowline_out  = parent / f"{base_stem}_flowlines.shp"
         catchment_out = parent / f"{base_stem}_catchments.shp"
 
-        # ── 1. Load accumulated flow data from HSR output ──────────────────────
-        flow_file = hsr_dir / "Output" / "FlowAccum" / f"ComIDQ12WY{wy}.csv"
-        if not flow_file.exists():
-            candidates = sorted((hsr_dir / "Output" / "FlowAccum").glob(f"ComIDQ12WY{wy}*.csv")) if (hsr_dir / "Output" / "FlowAccum").exists() else []
-            if candidates:
-                flow_file = candidates[0]
-            else:
-                legacy = hsr_dir / "Output" / f"QYConWY{wy}.dat"
-                legacy_candidates = sorted((hsr_dir / "Output").glob(f"QYCon*{wy}*.dat")) if (hsr_dir / "Output").exists() else []
-                if legacy.exists():
-                    flow_file = legacy
-                elif legacy_candidates:
-                    flow_file = legacy_candidates[0]
+        # ── 1. Load and merge flow data across ALL requested years ─────────────
+        combined_flow: pd.DataFrame | None = None
+        all_cfs_cols: list[str] = []   # every YYYY_Mon_CFS column added
+
+        for wy in years:
+            # Locate the accumulated-flow file for this year
+            flow_file = hsr_dir / "Output" / "FlowAccum" / f"ComIDQ12WY{wy}.csv"
+            if not flow_file.exists():
+                candidates = sorted(
+                    (hsr_dir / "Output" / "FlowAccum").glob(f"ComIDQ12WY{wy}*.csv")
+                ) if (hsr_dir / "Output" / "FlowAccum").exists() else []
+                if candidates:
+                    flow_file = candidates[0]
                 else:
-                    raise FileNotFoundError(
-                        f"Accumulated flow file not found: {flow_file}\n"
-                        f"Run Steps 1-6 first, or check that WY{wy} data exists in {hsr_dir / 'Output' / 'FlowAccum'}"
-                    )
-            self._log(f"Using accumulated flow file: {flow_file}\n")
+                    legacy = hsr_dir / "Output" / f"QYConWY{wy}.dat"
+                    legacy_candidates = sorted(
+                        (hsr_dir / "Output").glob(f"QYCon*{wy}*.dat")
+                    ) if (hsr_dir / "Output").exists() else []
+                    if legacy.exists():
+                        flow_file = legacy
+                    elif legacy_candidates:
+                        flow_file = legacy_candidates[0]
+                    else:
+                        raise FileNotFoundError(
+                            f"Accumulated flow file not found for WY{wy}: "
+                            f"{hsr_dir / 'Output' / 'FlowAccum' / f'ComIDQ12WY{wy}.csv'}\n"
+                            "Run Steps 1-6 for that year first."
+                        )
+            self._log(f"Reading WY{wy} flow data from {flow_file}\n")
 
-        # Read flow data — expect columns: ComID, M01..M12 (CFS)
-        self._log(f"Reading flow data from {flow_file}\n")
-        try:
-            flow_df = pd.read_csv(flow_file, sep=r"\s+", comment="#")
-        except Exception:
-            flow_df = pd.read_csv(flow_file)
+            # Read — try whitespace-delimited first, fall back to comma
+            try:
+                yr_df = pd.read_csv(flow_file, sep=r"\s+", comment="#")
+            except Exception:
+                yr_df = pd.read_csv(flow_file)
 
-        # AFConFlowAccum outputs comma-delimited ComIDQ12yyyy.csv with headers like
-        # ComID,QAccConOct,...,QAccConSep. If whitespace parsing collapses into one
-        # string column, re-read with the default comma delimiter.
-        if flow_df.shape[1] == 1:
-            only_col = str(flow_df.columns[0])
-            if "," in only_col:
-                flow_df = pd.read_csv(flow_file, comment="#")
+            # If whitespace split collapsed everything into one column, re-read as CSV
+            if yr_df.shape[1] == 1:
+                only_col = str(yr_df.columns[0])
+                if "," in only_col:
+                    yr_df = pd.read_csv(flow_file, comment="#")
 
-        if flow_df.shape[1] < 2:
-            raise RuntimeError(
-                f"Unable to parse accumulated flow file columns from {flow_file}. "
-                "Expected ComID plus 12 monthly flow columns."
+            if yr_df.shape[1] < 2:
+                raise RuntimeError(
+                    f"Unable to parse columns from {flow_file}. "
+                    "Expected ComID plus 12 monthly flow columns."
+                )
+
+            cols = list(yr_df.columns)
+            comid_col = next(
+                (c for c in ["ComID", "COMID", "ComIDVAA", "ComIDVaa", "Comid"] if c in cols),
+                cols[0],
             )
+            yr_df[comid_col] = pd.to_numeric(yr_df[comid_col], errors="coerce").astype("Int64")
+            yr_df = yr_df.dropna(subset=[comid_col]).copy()
+            yr_df = yr_df.rename(columns={comid_col: "ModelComID"})
 
-        # Identify ComID-like key column and month columns
-        cols = list(flow_df.columns)
-        comid_col = next(
-            (
-                c
-                for c in ["ComID", "COMID", "ComIDVAA", "ComIDVaa", "Comid"]
-                if c in cols
-            ),
-            cols[0],
-        )
-        flow_df[comid_col] = pd.to_numeric(flow_df[comid_col], errors="coerce").astype("Int64")
-        flow_df = flow_df.dropna(subset=[comid_col]).copy()
+            # The 12 data columns (after ModelComID) map to WY months 1-12
+            month_data_cols = [c for c in yr_df.columns if c != "ModelComID"][:12]
 
-        # Build month column mapping: 12 data columns after ComID
-        month_data_cols = [c for c in cols[1:] if c != comid_col][:12]
-        cfs_month_map: dict[int, str] = {}
-        for i, col in enumerate(month_data_cols):
-            mo = i + 1  # WY month 1=Oct … 12=Sep
-            cfs_month_map[mo] = col
+            # Rename to YYYY_Mon_CFS; keep only requested months
+            rename_map: dict[str, str] = {}
+            wy_cfs_cols: list[str] = []
+            for i, raw_col in enumerate(month_data_cols):
+                mo = i + 1
+                if mo not in months:
+                    continue
+                # 10-char limit: "2018_Oct_C" = 10 chars exactly — fits fine
+                new_col = f"{wy}_{WY_MONTH_NAMES.get(mo, f'M{mo:02d}')}_CFS"
+                # Truncate to 10 chars to stay within ESRI Shapefile limit
+                new_col = new_col[:10]
+                rename_map[raw_col] = new_col
+                wy_cfs_cols.append(new_col)
 
-        flow_df = flow_df.copy()
-        flow_df["ModelComID"] = pd.to_numeric(flow_df[comid_col], errors="coerce").astype("Int64")
+            keep_cols = ["ModelComID"] + list(rename_map.keys())
+            yr_df = yr_df[keep_cols].rename(columns=rename_map)
+            all_cfs_cols.extend(wy_cfs_cols)
+
+            if combined_flow is None:
+                combined_flow = yr_df
+            else:
+                combined_flow = combined_flow.merge(yr_df, on="ModelComID", how="outer")
+
+        if combined_flow is None or combined_flow.empty:
+            raise RuntimeError("No flow data was loaded for any requested year.")
+
+        flow_df = combined_flow.copy()
+        flow_df["ModelComID"] = pd.to_numeric(flow_df["ModelComID"], errors="coerce").astype("Int64")
         flow_df = flow_df.dropna(subset=["ModelComID"])
+
+        # ── 2. Inner helper: join flow_df to a geometry GeoDataFrame ───────────
 
         def _norm_reach(series: pd.Series) -> pd.Series:
             return (
@@ -1384,7 +1469,7 @@ class AFinchComprehensiveGUI:
                 .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
             )
 
-        def _build_joined_geodataframe(geom_gdf: pd.DataFrame, geom_label: str) -> gpd.GeoDataFrame:
+        def _build_joined_geodataframe(geom_gdf: gpd.GeoDataFrame, geom_label: str) -> gpd.GeoDataFrame:
             geom_gdf = geom_gdf.copy()
             geom_gdf["ComID"] = pd.to_numeric(geom_gdf["ComID"], errors="coerce").astype("Int64")
             geom_gdf = geom_gdf.dropna(subset=["ComID"])
@@ -1396,22 +1481,25 @@ class AFinchComprehensiveGUI:
 
             self._log(
                 f"ComID Matching Diagnostics ({geom_label}):\n"
-                f"  Modeled ComIDs: {len(modeled_comids)} unique (range: {min(modeled_comids)} to {max(modeled_comids)})\n"
-                f"  Geometry ComIDs: {len(set(geom_gdf['ComID'].dropna().tolist()))} unique (range: {geom_gdf['ComID'].min()} to {geom_gdf['ComID'].max()})\n"
-                f"  Direct match found: {len(direct)} of {before_filter} geometries\n",
-                "info"
+                f"  Modeled ComIDs: {len(modeled_comids)} unique "
+                f"(range: {min(modeled_comids)} to {max(modeled_comids)})\n"
+                f"  Geometry ComIDs: {len(set(geom_gdf['ComID'].dropna().tolist()))} unique "
+                f"(range: {geom_gdf['ComID'].min()} to {geom_gdf['ComID'].max()})\n"
+                f"  Direct match found: {len(direct)} of {before_filter} geometries\n"
             )
 
             flow_join = flow_df.copy()
+
             if direct.empty:
-                geom_reach_col = "REACHCODE" if "REACHCODE" in geom_gdf.columns else (
-                    "ReachCode" if "ReachCode" in geom_gdf.columns else (
-                        "OrigReachCode" if "OrigReachCode" in geom_gdf.columns else None
-                    )
+                # Fallback: join via ReachCode crosswalk
+                geom_reach_col = next(
+                    (c for c in ["REACHCODE", "ReachCode", "OrigReachCode"] if c in geom_gdf.columns),
+                    None,
                 )
                 if geom_reach_col is None:
                     raise RuntimeError(
-                        f"No matching ComIDs for {geom_label}, and geometry has no ReachCode field for fallback join."
+                        f"No matching ComIDs for {geom_label}, and geometry has no "
+                        "ReachCode field for fallback join."
                     )
 
                 crosswalk = None
@@ -1429,17 +1517,25 @@ class AFinchComprehensiveGUI:
                 if crosswalk is None:
                     if not catchment_gpkg.exists():
                         raise RuntimeError(
-                            f"No matching ComIDs for {geom_label}, and no crosswalk file is available for ReachCode fallback."
+                            f"No matching ComIDs for {geom_label}, and no crosswalk "
+                            "file is available for ReachCode fallback."
                         )
-                    crosswalk = gpd.read_file(catchment_gpkg, columns=["NHDPlusID", "OrigReachCode"]).rename(
-                        columns={"NHDPlusID": "ModelComID"}
-                    )
+                    crosswalk = gpd.read_file(
+                        catchment_gpkg, columns=["NHDPlusID", "OrigReachCode"]
+                    ).rename(columns={"NHDPlusID": "ModelComID"})
 
-                crosswalk["ModelComID"] = pd.to_numeric(crosswalk["ModelComID"], errors="coerce").astype("Int64")
+                crosswalk["ModelComID"] = (
+                    pd.to_numeric(crosswalk["ModelComID"], errors="coerce").astype("Int64")
+                )
                 crosswalk["OrigReachCode"] = _norm_reach(crosswalk["OrigReachCode"])
-                crosswalk = crosswalk.dropna(subset=["ModelComID", "OrigReachCode"]).drop_duplicates(subset=["ModelComID"])
+                crosswalk = (
+                    crosswalk.dropna(subset=["ModelComID", "OrigReachCode"])
+                    .drop_duplicates(subset=["ModelComID"])
+                )
 
-                flow_join = flow_join.merge(crosswalk[["ModelComID", "OrigReachCode"]], on="ModelComID", how="left")
+                flow_join = flow_join.merge(
+                    crosswalk[["ModelComID", "OrigReachCode"]], on="ModelComID", how="left"
+                )
                 flow_join["JoinKey"] = _norm_reach(flow_join["OrigReachCode"])
                 flow_join = flow_join.dropna(subset=["JoinKey"])
 
@@ -1448,20 +1544,30 @@ class AFinchComprehensiveGUI:
                 matched_keys = set(flow_join["JoinKey"].tolist())
                 direct = geom_gdf[geom_gdf["JoinKey"].isin(matched_keys)].copy()
                 join_mode = "reachcode"
-                self._log(f"ComID direct match failed for {geom_label}; using modeled ComID -> ReachCode crosswalk join.\n", "warn")
+                self._log(
+                    f"ComID direct match failed for {geom_label}; "
+                    "using modeled ComID -> ReachCode crosswalk join.\n",
+                    "warn",
+                )
             else:
                 flow_join["JoinKey"] = flow_join["ModelComID"].astype("int64").astype(str)
                 direct["JoinKey"] = direct["ComID"].astype("int64").astype(str)
 
             if direct.empty:
-                raise RuntimeError(f"No matching reaches between modeled flow output and {geom_label} geometry source.")
+                raise RuntimeError(
+                    f"No matching reaches between modeled flow output and {geom_label} geometry source."
+                )
             if len(direct) < before_filter:
-                self._log(f"Filtered {geom_label} geometry to modeled reaches: {len(direct):,} of {before_filter:,}\n")
+                self._log(
+                    f"Filtered {geom_label} geometry to modeled reaches: "
+                    f"{len(direct):,} of {before_filter:,}\n"
+                )
 
             self._log(f"Joining flow data to {len(direct)} {geom_label} geometries…\n")
 
             out_df = direct[["ComID", "geometry", "JoinKey"]].copy()
             out_df["ComID"] = out_df["ComID"].astype("int64")
+
             if join_mode == "reachcode":
                 out_df = out_df.rename(columns={"ComID": "NHDCOMID"})
                 reach_to_model = (
@@ -1475,25 +1581,24 @@ class AFinchComprehensiveGUI:
             else:
                 out_df = out_df.rename(columns={"ComID": "COMID"})
 
-            for mo in months:
-                if mo not in cfs_month_map:
-                    self._log(f"  ⚠ WY Month {mo} not found in flow data, skipping.\n", "warn")
-                    continue
-                src_col = cfs_month_map[mo]
-                mo_label = WY_MONTH_NAMES.get(mo, f"M{mo:02d}")
-                col_name = f"{wy}_{mo_label}_CFS"[:10]
-                mo_data = flow_join[["JoinKey", src_col]].rename(columns={src_col: col_name})
-                out_df = out_df.merge(mo_data, on="JoinKey", how="left")
+            # ── Join ALL pre-renamed CFS columns in a single merge ─────────────
+            out_df = out_df.merge(
+                flow_join[["JoinKey"] + all_cfs_cols],
+                on="JoinKey",
+                how="left",
+            )
 
-            cfs_cols = [c for c in out_df.columns if "CFS" in c]
-            if cfs_cols:
-                non_null_counts = out_df[cfs_cols].notna().sum()
-                nan_pct = (1 - non_null_counts / len(out_df)) * 100
-                for col, pct in zip(cfs_cols, nan_pct):
+            # Warn if any CFS column is mostly NaN (likely join failure)
+            cfs_cols_present = [c for c in out_df.columns if "CFS" in c]
+            if cfs_cols_present:
+                non_null_counts = out_df[cfs_cols_present].notna().sum()
+                nan_pcts = (1 - non_null_counts / len(out_df)) * 100
+                for col, pct in zip(cfs_cols_present, nan_pcts):
                     if pct > 50:
                         self._log(
-                            f"⚠ WARNING ({geom_label}): {col} is {pct:.1f}% NaN. Join may have failed.\n",
-                            "warn"
+                            f"⚠ WARNING ({geom_label}): {col} is {pct:.1f}% NaN. "
+                            "Join may have failed.\n",
+                            "warn",
                         )
 
             out_df = out_df.drop(columns=["JoinKey"])
@@ -1502,15 +1607,7 @@ class AFinchComprehensiveGUI:
                 out_gdf = out_gdf.to_crs("EPSG:4326")
             return out_gdf
 
-        # WY month → calendar month label mapping (Oct=1 → Oct, …, Sep=12 → Sep)
-        WY_MONTH_NAMES = {
-            1: "Oct", 2: "Nov", 3: "Dec",
-            4: "Jan", 5: "Feb", 6: "Mar",
-            7: "Apr", 8: "May", 9: "Jun",
-            10: "Jul", 11: "Aug", 12: "Sep",
-        }
-
-        # Build and write flowline output (ArcMap style: NHDFlowline + ComIDQ12yyyy join)
+        # ── 3. Build flowline output ───────────────────────────────────────────
         flowline_geom = None
         for candidate in flowline_candidates:
             if not candidate.exists():
@@ -1521,7 +1618,10 @@ class AFinchComprehensiveGUI:
                 continue
             if probe.empty:
                 continue
-            comid_field = next((c for c in ["ComID", "COMID", "NHDPlusID", "GridCode"] if c in probe.columns), None)
+            comid_field = next(
+                (c for c in ["ComID", "COMID", "NHDPlusID", "GridCode"] if c in probe.columns),
+                None,
+            )
             if comid_field is None:
                 continue
             geom_types = set(probe.geometry.geom_type.dropna().unique().tolist())
@@ -1541,7 +1641,7 @@ class AFinchComprehensiveGUI:
 
         flowline_gdf = _build_joined_geodataframe(flowline_geom, "flowline")
 
-        # Build and write catchment polygon output
+        # ── 4. Build catchment polygon output ─────────────────────────────────
         if not catchment_gpkg.exists():
             raise FileNotFoundError(
                 f"Catchment geometry file not found: {catchment_gpkg}. "
@@ -1549,30 +1649,25 @@ class AFinchComprehensiveGUI:
             )
         self._log(f"Loading catchment geometry from {catchment_gpkg}\n")
         catch_geom = gpd.read_file(catchment_gpkg)
-        catch_comid_field = "NHDPlusID" if "NHDPlusID" in catch_geom.columns else (
-            "ComID" if "ComID" in catch_geom.columns else (
-                "COMID" if "COMID" in catch_geom.columns else catch_geom.columns[0]
-            )
+        catch_comid_field = next(
+            (c for c in ["NHDPlusID", "ComID", "COMID"] if c in catch_geom.columns),
+            catch_geom.columns[0],
         )
         catch_geom = catch_geom.rename(columns={catch_comid_field: "ComID"})
         catchment_gdf = _build_joined_geodataframe(catch_geom, "catchment")
 
-        # Write both outputs
+        # ── 5. Write both outputs ─────────────────────────────────────────────
         out_shp.parent.mkdir(parents=True, exist_ok=True)
 
         self._log(f"Writing flowline shapefile: {flowline_out}\n")
         flowline_gdf.to_file(str(flowline_out), driver="ESRI Shapefile")
-        self._log(
-            f"Done flowlines. {len(flowline_gdf):,} features, "
-            f"{len([c for c in flowline_gdf.columns if 'CFS' in c])} month column(s).\n"
-        )
+        n_fl_cfs = len([c for c in flowline_gdf.columns if "CFS" in c])
+        self._log(f"Done flowlines. {len(flowline_gdf):,} features, {n_fl_cfs} CFS column(s).\n")
 
         self._log(f"Writing catchment shapefile: {catchment_out}\n")
         catchment_gdf.to_file(str(catchment_out), driver="ESRI Shapefile")
-        self._log(
-            f"Done catchments. {len(catchment_gdf):,} features, "
-            f"{len([c for c in catchment_gdf.columns if 'CFS' in c])} month column(s).\n"
-        )
+        n_ca_cfs = len([c for c in catchment_gdf.columns if "CFS" in c])
+        self._log(f"Done catchments. {len(catchment_gdf):,} features, {n_ca_cfs} CFS column(s).\n")
 
         return flowline_out, catchment_out
 
